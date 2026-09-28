@@ -434,7 +434,10 @@ docking_control:
   kd_position: 0.6
   kp_attitude_hz: 0.15
   kd_attitude: 0.6
-  max_correction_speed_mps: 0.015
+  # far-away alignment speed is about max_correction_speed / (1 + kd_position): 0.015 gave
+  # ~7 mm/s in Isaac (2026-09-23). 0.03 on the 1-D payload model: gate pass 41 -> 27 s, no
+  # re-exit of the 50 mm band, same residual. NEEDS_ISAAC_VALIDATION (0.025 if rollbacks)
+  max_correction_speed_mps: 0.03
   max_correction_rate_deg_s: 2.0
   max_accel_mps2: 0.01
   max_angular_accel_deg_s2: 1.0
