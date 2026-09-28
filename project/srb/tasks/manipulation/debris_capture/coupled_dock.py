@@ -74,7 +74,8 @@ class DockingControlCfg:
     kp_attitude_hz: float = 0.15
     kd_attitude: float = 0.6
     # Correction limits (on top of the target's own motion)
-    max_correction_speed_mps: float = 0.015
+    # far-field speed ~ max_correction_speed_mps / (1 + kd_position) (see vision_capture.yaml)
+    max_correction_speed_mps: float = 0.03
     max_correction_rate_deg_s: float = 2.0
     # Change of the commanded tip velocity per second: stepping it kicks the 3 t payload
     max_accel_mps2: float = 0.01

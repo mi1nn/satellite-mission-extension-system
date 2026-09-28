@@ -382,6 +382,10 @@ python3 project/scripts/compare_docking_control.py \
 ## 7. 한계와 남은 작업
 
 1. **게인은 toy 모델 기준입니다.** 실제 팔의 IK, 관절 스텝 제한, 6자유도 결합에서 수렴하는지 Isaac 결과로 확인해야 합니다.
+   - 2026-09-28: `max_correction_speed_mps`를 0.015 → **0.03**으로 변경했습니다. 먼 거리 정렬 속도는 약 `상한 / (1 + Kd)`라서, 0.015에서는 Isaac 실측 약 7 mm/s(toy 8 mm/s)였습니다.
+   - toy 모델(좌우 420 mm 시작, client 20 mm/s 표류)에서 정렬 확인 통과 시간은 41 s → 27 s입니다. 50 mm 안에 들어간 뒤 다시 벌어지지 않았고, 마지막 10 s 잔여 오차(0.7 mm)도 같습니다.
+   - 0.02는 표류 + 텀블링에서 79 mm까지 다시 벌어졌고(복귀 기준 80 mm), Kd 0.3은 0.03과 조합하면 86 mm로 복귀 기준을 넘어 제외했습니다.
+   - Isaac에서 `rollback_count`가 생기면 0.025로 낮춥니다(`--set docking_control.max_correction_speed_mps=0.025`).
 2. **자세 진입 기준 4°는 roll을 포함한 3축 전체 각도입니다.** legacy 설정은 기울기 12°, roll 5°로 느슨합니다. 팔이 4°까지 도달하지 못하면 `ALIGNMENT_CHECK`에서 시간 초과가 날 수 있습니다. 그 경우 `docking_alignment.orientation_threshold_deg`를 조정합니다.
 3. **depth 보정 규칙은 legacy와 같습니다.** 축 위 15 mm, 1° 이내에서만 보정합니다. non-forced 모드에서는 보정 전에는 접근하지 않습니다.
 4. **운반 구간은 예측을 쓰지 않습니다.** 4.8 m 자유 공간 이동이라 이번 범위에서 제외했습니다.
