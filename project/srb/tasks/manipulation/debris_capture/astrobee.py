@@ -7,7 +7,11 @@ only output (ROS 2 `sensor_msgs/Image`, `/<astrobee.ros_namespace>/<astrobee.ima
 What it does NOT do: no MEP search / capture, no AprilTag or marker detection, no pose
 estimation or vision tracking, no satellite state / angular-velocity estimate, no docking
 feasibility (no DOCKING_AVAILABLE / DOCKING_UNAVAILABLE), no mission decision, no command
-to the Canadarm3 / MEP / docking pipeline. Nothing it does feeds back into the mission.
+to the Canadarm3 / MEP / docking pipeline. Nothing it does feeds back into the mission --
+except the optional docking damping assist (`astrobee.assist.enabled`, off by default,
+`astrobee_assist.py`): it grabs the probe root and damps the arm + payload swing with
+thrust on the MEP during the aligning states, and lets go before the probe reaches the
+nozzle. While engaged it replaces the observation flight below.
 
 The one input it reacts to (`follow_mrv_after_dock`): the mission state on the existing
 latched MRV topic `/<ros.namespace>/state` (std_msgs/String, `ros_interface.py`; with
@@ -45,6 +49,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .astrobee_assist import AstrobeeAssistCfg, DampingAssist, MepContext, validate_assist_cfg
 from .frames import Frame
 
 ASTROBEE_STATES = (
@@ -154,6 +159,8 @@ class AstrobeeCfg:
     ros_node_name: str = "astrobee_observer"
     image_topic: str = "camera/image_raw"
     camera: AstrobeeCameraCfg = field(default_factory=AstrobeeCameraCfg)
+    # Docking damping assist (`astrobee_assist.py`, off by default)
+    assist: AstrobeeAssistCfg = field(default_factory=AstrobeeAssistCfg)
 
 
 def validate_astrobee_cfg(cfg: AstrobeeCfg):
@@ -191,6 +198,7 @@ def validate_astrobee_cfg(cfg: AstrobeeCfg):
         raise ValueError("astrobee.camera.publish_rate_hz must be > 0 and save_every_s >= 0")
     if len(c.mount_pos_body_m) != 3:
         raise ValueError("astrobee.camera.mount_pos_body_m must be [x, y, z]")
+    validate_assist_cfg(cfg.assist)
 
 
 ###############
@@ -465,6 +473,12 @@ class AstrobeeObserver:
         self.speed_mps = 0.0
         self.rel_speed_mps = 0.0
         self._last: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
+        self._vel = np.zeros(3)
+        ## Docking damping assist (`astrobee_assist.py`, `assist.enabled`): the caller reads
+        ## `assist_force_w` / `assist_grip_w` after `step` and applies the thrust to the MEP
+        self.assist = DampingAssist(cfg.assist) if cfg.assist.enabled else None
+        self.assist_force_w: Optional[np.ndarray] = None
+        self.assist_grip_w: Optional[np.ndarray] = None
         self.save_dir: Optional[Path] = None
         if cfg.camera.save_every_s > 0.0 and out_dir is not None:
             self.save_dir = Path(out_dir) / f"{label}_astrobee"
@@ -505,12 +519,15 @@ class AstrobeeObserver:
                   f"{' on ROS' if self.ros is not None else ''}): observation loop stopped at "
                   f"{np.round(self._last[1], 2).tolist()}, following the MRV from {np.round(self._follow['mrv0'], 2).tolist()}", flush=True)
 
-    def step(self, t: float, mission_state: Optional[str] = None):
+    def step(self, t: float, mission_state: Optional[str] = None, mep_ctx: Optional[MepContext] = None):
         """Place the Astrobee and its camera for time `t` [s, simulation].
 
         `mission_state`: the mission state in-process, used as the docking-complete
-        signal only when ROS is off (with ROS the MRV state topic is)."""
+        signal only when ROS is off (with ROS the MRV state topic is). The damping
+        assist always uses the in-process state: it acts on the in-process MEP
+        (`mep_ctx`, None = no MEP data this step: an engaged assist holds its pose)."""
         torch = self._torch
+        mission_now = mission_state
         self._check_dock_signal(t, mission_state)
         if self.ros is not None and self._follow is not None and self._follow.get("close_t0") is None:
             # Close-in signal (`CLOSE_IN_STATES`): same source as the docking-complete one
@@ -538,15 +555,29 @@ class AstrobeeObserver:
             phase, offset, idx = self.path.sample(t)
             pos = center + offset
             aim = center + self.cfg.look_at_dock_weight * (dock - center)
+        self.assist_force_w = None
+        if self.assist is not None and self._follow is None and self._last is not None:
+            dt = max(t - self._last[0], 0.0)
+            out = self.assist.step(t, dt, mission_now, self._last[1], self._vel, mep_ctx) if dt > 0.0 and mep_ctx is not None else None
+            if out is not None:
+                phase, pos, aim = "assist", out.pos, out.aim
+                self.assist_force_w, self.assist_grip_w = out.force_w, out.grip_w
+            elif self.assist.phase is not None:  # engaged but no MEP data: hold still
+                phase, pos, aim = "assist", self._last[1].copy(), self._aim
+            if phase == "assist":
+                offset = pos - center
         self._aim = np.asarray(aim, dtype=float)
         body = Frame(pos, look_at_rotation(pos, aim))
         if self._last is not None and t > self._last[0]:
             dt = t - self._last[0]
             self.speed_mps = float(np.linalg.norm(pos - self._last[1])) / dt
             self.rel_speed_mps = float(np.linalg.norm(offset - self._last[2])) / dt
+            self._vel = (pos - self._last[1]) / dt
         self._last = (t, pos.copy(), np.asarray(offset, dtype=float).copy())
         if phase == "follow":
             self._set_state("ASTROBEE_FOLLOW_MRV")
+        elif phase == "assist":
+            self.state = self.assist.phase  # `DampingAssist` logs its own transitions
         elif phase == "observe" and self.state in (None, "ASTROBEE_IDLE", "ASTROBEE_APPROACH"):
             self._set_state("ASTROBEE_OBSERVATION_START", "at inspection point 1")
         else:

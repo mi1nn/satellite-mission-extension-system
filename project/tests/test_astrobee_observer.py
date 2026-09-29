@@ -153,14 +153,17 @@ def test_astrobee_publishes_the_camera_image_only():
     """Role separation: one publisher (the image), one subscription (the existing MRV
     state topic, docking-complete signal), and no import of the vision / capture /
     docking-control code (the only package imports are frame math, the USD prim-frame
-    helper and the rclpy loader)."""
+    helper, the rclpy loader and the pure-numpy damping assist, whose thrust the demo
+    applies)."""
     tree = ast.parse((_PKG_DIR / "astrobee.py").read_text())
     pubs = _calls(tree, "create_publisher")
     assert len(pubs) == 1 and ast.unparse(pubs[0].args[0]) == "Image"
     subs = _calls(tree, "create_subscription")
     assert len(subs) == 1 and ast.unparse(subs[0].args[0]) == "String"
     local = {(n.module, a.name) for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level == 1 for a in n.names}
-    assert local == {("frames", "Frame"), ("docking", "prim_frame"), ("ros_interface", "_import_rclpy")}
+    assert local == {("frames", "Frame"), ("docking", "prim_frame"), ("ros_interface", "_import_rclpy"),
+                     ("astrobee_assist", "AstrobeeAssistCfg"), ("astrobee_assist", "DampingAssist"),
+                     ("astrobee_assist", "MepContext"), ("astrobee_assist", "validate_assist_cfg")}
 
 
 def test_db_bridge_has_no_astrobee_entries():

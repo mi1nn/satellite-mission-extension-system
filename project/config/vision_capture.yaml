@@ -668,3 +668,35 @@ astrobee:
     publish_rate_hz: 5.0
     # PNG frame every N s under logs/vision_capture/<tag>_astrobee/ (0 = off)
     save_every_s: 0.0
+  ## Docking damping assist (`astrobee_assist.py`). Off by default: with enabled: false
+  ## the Astrobee is the observation camera above and nothing else changes.
+  ##   ASTROBEE_ASSIST_RENDEZVOUS -> ASTROBEE_ASSIST_FINAL_APPROACH -> ASTROBEE_ASSIST_GRASPED
+  ##   -> ASTROBEE_DAMPING_ASSIST -> ASTROBEE_ASSIST_RELEASE -> ASTROBEE_ASSIST_STANDBY
+  ## Grabs the probe near its root and damps the arm + 3 t payload swing with
+  ## F = clip(-c (v_grip - v_ref), max_force_n), applied to the MEP at the grip point.
+  ## max_force_n is a hypothetical scaled-up free-flyer: a real Astrobee gives ~0.6 N,
+  ## far too little for a 3 t payload (see the astrobee_assist.py docstring).
+  assist:
+    enabled: false
+    max_force_n: 5.0
+    # [N s/m]; 300 adds ~0.16 damping ratio on the 3 t, 20 s mode
+    damping_n_s_per_m: 300.0
+    # Grip point on the rod: 0 = root (MEP body side), 1 = tip
+    grip_fraction_from_root: 0.15
+    grip_standoff_m: 1.0
+    standby_distance_m: 3.0
+    standby_tolerance_m: 0.3
+    transit_speed_mps: 2.0
+    final_approach_speed_mps: 0.1
+    retreat_speed_mps: 0.1
+    max_accel_mps2: 0.2
+    grasp_position_tol_m: 0.02
+    grasp_speed_tol_mps: 0.01
+    # Fly to the standby point beside the probe and wait (MEP still free-floating) ...
+    standby_states: [ARM_DEPLOY, SEARCH, TAG_DETECTED, POSE_ESTIMATED, PREDICTING, APPROACHING, SLOW_APPROACH,
+                     CAPTURE_ATTEMPT, CAPTURED]
+    # ... fly in / grasp during these mission states (MEP held by the arm) ...
+    engage_states: [HOLDING, RETREAT, CLIENT_RELEASE, CLIENT_CRUISE, CHASE, VELOCITY_MATCHING, RENDEZVOUS,
+                    DOCK_TARGET_ACQUIRE]
+    # ... thrust during these; any other state releases the probe (Z_APPROACH: before contact)
+    damping_states: [PRE_DOCK_APPROACH, XY_ALIGN, ORIENTATION_ALIGN, POSITION_ATTITUDE_ALIGN, ALIGNMENT_CHECK]

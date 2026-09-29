@@ -585,6 +585,11 @@ class VisionCaptureDemo:
         self._mv_d_ref: Optional[np.ndarray] = None  # verified client -> MRV offset (world)
         self._mv_sep_dir: Optional[np.ndarray] = None
         self._mv_force: Dict[str, np.ndarray] = {}
+        # Arm reference twist (v, w) [m/s, rad/s, world] last sent as joint velocity target,
+        # at the IK tool point (`set_velocity_feedforward`); v_ref of the Astrobee assist
+        self._ee_ref_twist: Tuple[np.ndarray, np.ndarray] = (np.zeros(3), np.zeros(3))
+        # Astrobee damping assist thrust currently on the MEP (None: off)
+        self._assist_force: Optional[np.ndarray] = None
         self._mvm: Dict[str, object] = {}  # measurements of the current step
         self._mv: Dict[str, object] = {}  # bookkeeping / metrics
         self._arm_stow: Optional[dict] = None  # MRV_SEPARATION arm return (`arm_stow_step`)
@@ -788,6 +793,8 @@ class VisionCaptureDemo:
         six_dof gives the MEP angular velocity).
         """
         n = len(self.arm.joint_ids)
+        self._ee_ref_twist = (self.mrv_base_velocity() if v_ff is None else np.asarray(v_ff, dtype=float).copy(),
+                              np.zeros(3) if w_ff is None else np.asarray(w_ff, dtype=float).copy())
         if v_ff is None:
             qd = torch.zeros((1, n), device=self.arm.device)
         else:
@@ -1342,6 +1349,7 @@ class VisionCaptureDemo:
         sim, scene = self.sim, self.scene
         self.q_hold = self.arm.joint_pos().clone()
         print("[DEMO] Scenario finished -- the simulation keeps running with the MEP held. Close the Isaac Sim window to exit.", flush=True)
+        self.assist_thrust_off()
         n = 0
         with torch.no_grad():
             while self.sim_app.is_running():
@@ -1361,6 +1369,40 @@ class VisionCaptureDemo:
                 scene.update(dt=self.dt)
                 if n % self.render_interval == 0 and self.astrobee is not None:
                     self.astrobee.after_render(t_obs + self.dt)
+
+    ## Astrobee docking damping assist (`astrobee_assist.py`, `astrobee.assist.enabled`)
+    def assist_context(self):
+        """MEP data for the assist (None when it is off). Also in failure / terminal
+        states, so an engaged assist sees them and lets go of the probe."""
+        if self.astrobee is None or self.astrobee.assist is None:
+            return None
+        from .astrobee_assist import MepContext, grip_point_in_mep
+
+        pr = self.geo.probe
+        grip_in_mep = grip_point_in_mep(pr.tip, pr.direction, pr.length, self.cfg.astrobee.assist.grip_fraction_from_root)
+        mep = self.mep_frame()
+        grip = mep.point(grip_in_mep)
+        v_ref, w_ref = self._ee_ref_twist
+        return MepContext(mep=mep, grip_in_mep=grip_in_mep, axis_in_mep=np.asarray(pr.direction, dtype=float),
+                          grip_velocity=self.gt_mep_velocity_at(grip)[0],
+                          reference_velocity=v_ref + np.cross(w_ref, grip - self.arm.tool_pose().pos))
+
+    def apply_assist_thrust(self):
+        """Astrobee thrust on the MEP at the grip point: force at the COM + r x F torque."""
+        f = None if self.astrobee is None else self.astrobee.assist_force_w
+        if f is None:
+            return self.assist_thrust_off()
+        com = self.mep.data.root_com_pos_w[0].cpu().numpy().astype(float)
+        self.apply_wrench("mep", f, np.cross(self.astrobee.assist_grip_w - com, f))
+        self._assist_force = np.asarray(f, dtype=float).copy()
+
+    def assist_thrust_off(self):
+        """Remove the assist wrench, unless another controller has set the MEP wrench since."""
+        if self._assist_force is None:
+            return
+        if np.allclose(self._mv_force.get("mep", np.zeros(3)), self._assist_force):
+            self.apply_wrench("mep", np.zeros(3), np.zeros(3))
+        self._assist_force = None
 
     def close_astrobee(self):
         """End of the run (after `idle()` in the GUI): stop the Astrobee camera feed."""
@@ -3384,6 +3426,10 @@ class VisionCaptureDemo:
             if self.astrobee is not None:
                 lines.append(f"Astrobee |v| {self.astrobee.speed_mps:6.3f} m/s   "
                              f"rel. satellite {self.astrobee.rel_speed_mps:6.3f} m/s")
+                if self.astrobee.assist is not None and self.astrobee.assist.phase is not None:
+                    f = self._assist_force
+                    lines.append(f"Astrobee assist {self.astrobee.assist.phase.replace('ASTROBEE_', '')}   "
+                                 f"|F| {0.0 if f is None else float(np.linalg.norm(f)):5.2f} N")
             if self._mv_active and self._mvm:
                 m = self._mvm
                 moved = {k: (float(np.linalg.norm(v[-1] - v[0])) if len(v) > 1 else 0.0) for k, v in self._trail.items()}
@@ -4151,7 +4197,8 @@ class VisionCaptureDemo:
                     elif self._client_live:
                         self.client_live_step()  # client drifting since t = 0 (MRV still static)
                     if self.astrobee is not None:
-                        self.astrobee.step(self.sim_time, self.state.value)
+                        self.astrobee.step(self.sim_time, self.state.value, self.assist_context())
+                        self.apply_assist_thrust()
                     scene.write_data_to_sim()
                     sim.step(render=False)
                     n += 1
@@ -4231,6 +4278,10 @@ class VisionCaptureDemo:
             r.metrics["capture_phase_start_s"] = self._capture_t0
         r.metrics["wall_time_s"] = time.time() - self.wall_start
         r.metrics["max_arm_contact_force_n"] = self._max_contact
+        if self.astrobee is not None and self.astrobee.assist is not None:
+            r.metrics["astrobee_assist"] = self.astrobee.assist.summary()
+            print("[ASTROBEE] assist: " + ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                                                   for k, v in r.metrics["astrobee_assist"].items()), flush=True)
         rows = self.rows
         valid = [x for x in rows if not math.isnan(x["position_error_mm"])]
         r.metrics["csv"] = str(self.csv_path)

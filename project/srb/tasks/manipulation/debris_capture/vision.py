@@ -335,7 +335,11 @@ def load_vision_config(path: Optional[str | Path] = None, overrides: Sequence[st
         section, _, name = key.strip().partition(".")
         if not name:
             raise ValueError(f"Override must look like 'section.key=value', got '{item}'")
-        _apply(cfg, {section: {name: yaml.safe_load(raw)}}, "")
+        # Nested sections: `astrobee.assist.enabled=true` -> {astrobee: {assist: {enabled: true}}}
+        nested = yaml.safe_load(raw)
+        for part in reversed(name.split(".")):
+            nested = {part: nested}
+        _apply(cfg, {section: nested}, "")
     d = np.asarray(cfg.mep.drift_direction, dtype=float)
     if np.linalg.norm(d) < 1e-9:
         raise ValueError("mep.drift_direction must be non-zero")
