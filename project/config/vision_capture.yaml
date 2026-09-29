@@ -656,7 +656,7 @@ astrobee:
     # model subtraction: mesh surface samples every N m, explained within N voxels
     model_sample_spacing_m: 0.015
     model_dilate_voxels: 1
-    # a confirmed obstruction stops the mission at once, in any phase (DOCKING_UNAVAILABLE)
+    # after min_corridor_views, a confirmed obstruction stops the mission before docking
     stop_mission_on_obstruction: true
     min_obstruction_voxels: 1
     # unobserved is never clear: depth frames that must have seen into the nozzle

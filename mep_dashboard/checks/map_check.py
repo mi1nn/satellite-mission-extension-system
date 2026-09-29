@@ -106,6 +106,10 @@ with client.websocket_connect("/ws/live") as ws:
     first = ws.receive_json()
 check("ws without ROS: offline JSON, no map field", first.get("connected") is False and "astrobee_map" not in first, first)
 
+missing_view = "DOCKING_UNAVAILABLE: Astrobee map, before Z_APPROACH: nozzle corridor not observed yet"
+check("unobserved corridor failure reason survives ROS normalization",
+      A.normalize_live_status({"state": "DOCKING_UNAVAILABLE", "failure": missing_view}, last_progress=4).get("failure") == missing_view)
+
 
 class StubBridge:
     """The three calls the WS loop makes, with one map snapshot + clearance."""
@@ -117,9 +121,11 @@ class StubBridge:
                        "nearest_m": 0.3, "points": 3, "map_seq": 1,
                        "zone": {"exit": [0.0, 0.0, 0.0], "axis": [1.0, 0.0, 0.0], "front_m": 1.0, "front_radius_m": 0.6,
                                 "inner": [[0.0, 0.35], [0.3, 0.33], [0.6, 0.3]]}}
+    failure = "DOCKING_UNAVAILABLE: Astrobee map: 1 obstruction voxel in the nozzle corridor"
 
     def snapshot(self):
-        return 1, {**A.normalize_live_status({"state": "DOCKING_UNAVAILABLE", "sim_time_s": 42.0}, last_progress=2),
+        return 1, {**A.normalize_live_status({"state": "DOCKING_UNAVAILABLE", "sim_time_s": 42.0,
+                                               "failure": self.failure}, last_progress=2),
                    "astrobee_map": self.status}
 
     def map_status(self):
@@ -266,9 +272,14 @@ try:
             A.live_ros.alive = True
             state = page.locator("#mission-state").inner_text()
             phase = page.locator("#mission-phase").inner_text()
-            check("browser: mission panel shows the stop (DOCKING UNAVAILABLE, stage kept, red)",
-                  state == "DOCKING UNAVAILABLE" and phase == "ASTROBEE: DOCKING PORT BLOCKED"
+            check("browser: mission panel shows the blocked port reason (stage kept, red)",
+                  state == "DOCKING UNAVAILABLE" and phase == A.live_ros.failure.removeprefix("DOCKING_UNAVAILABLE: ")
                   and "state-failure" in (page.locator("#mission-state").get_attribute("class") or ""), f"{state} | {phase}")
+            A.live_ros.failure = missing_view
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_function("document.getElementById('mission-phase').textContent.includes('not observed yet')")
+            check("browser: unobserved corridor reason readable without hovering",
+                  page.locator("#mission-phase").inner_text() == missing_view.removeprefix("DOCKING_UNAVAILABLE: "))
             page.screenshot(path=str(Path(__file__).resolve().parent / "map-live.png"))
             A.live_ros = None
             browser.close()

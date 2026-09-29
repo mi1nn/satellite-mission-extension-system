@@ -32,10 +32,10 @@ python3 -m venv --system-site-packages .venv
 
 ### LIVE MISSION — ROS 2 실시간
 
-- Isaac Sim 뷰포트와 카메라 3면: MEP 포착(cam_wrist), 위성 도킹(cam_probe), Astrobee 관찰
-- 임무 상태와 7단계 진행률, 총 속도 / 각속도 / 잔여 거리
-- 위치 오차 시계열 차트
-- **PLAY / PAUSE / STOP** → `/mrv/cmd/start`, `/cmd/pause`, `/cmd/abort` 발행
+- Isaac Sim 뷰포트와 카메라 3면: MEP 포착(cam_wrist), 위성 도킹(cam_probe), Astrobee RGB 관찰
+- CAMERA 4 · ASTROBEE MAP: 위성 좌표계 포인트 맵, 노즐 금지 구역 윤곽, 빨간 장애물 점과 `NOT OBSERVED` / `DOCKING AVAILABLE` / `DOCKING UNAVAILABLE` 판정. 맵이 없으면 WAITING
+- 임무 상태와 7단계 진행률(7단계 궤도 이송은 미구현), 총 속도 / 각속도 / 잔여 거리. `DOCKING_UNAVAILABLE`일 때 실제 중단 사유를 표시
+- 위치 오차 시계열 차트와 **PLAY / PAUSE / STOP** → `/mrv/cmd/start`, `/cmd/pause`, `/cmd/abort` 발행
 
 ### TECHNOLOGY VALIDATION — Firestore 기록
 
@@ -44,15 +44,17 @@ python3 -m venv --system-site-packages .venv
 - 단계별 텔레메트리 그래프. 그래프를 드래그하거나 슬라이더로 구간을 고르면
   구간 통계와 **EXPORT JSON** 이 그 구간만 다룹니다
 - MISSION VIDEO: 고른 구간의 임무 영상으로 이동합니다 (아래 참고)
+- 실행 종료 시 저장된 Astrobee 포인트 맵이 있으면 RUN INFORMATION에 `.ply` 다운로드 링크가 나타납니다. 서버는 파일이 없으면 404를 반환합니다
 
 ## 데이터 경로
 
 ```text
 GPU PC: Isaac Sim (vision_capture.py)
    │  /mrv/** (sensor_msgs/Image, PoseStamped, String ...)
+   │  /astrobee/camera/image_raw + /astrobee/map/{clearance,points}
    │  ROS 2 DDS · 같은 ROS_DOMAIN_ID
-   ├─► backend/app.py  RosLiveBridge ──► /api/live/*.jpg, /ws/live ──► LIVE 탭
-   └─► firebase_bridge.py ──► Firestore ──► /api/validation/* ──► VALIDATION 탭
+   ├─► backend/app.py  RosLiveBridge ──► /api/live/*.jpg, /ws/live (JSON + 맵 바이너리) ──► LIVE 탭
+   └─► firebase_bridge.py ──► Firestore + 세션 .ply ──► /api/validation/* ──► VALIDATION 탭
 ```
 
 ### API
@@ -67,6 +69,7 @@ GPU PC: Isaac Sim (vision_capture.py)
 | `GET /api/validation/runs` | 실행 목록 |
 | `GET /api/validation/runs/{id}/telemetry` | 실행 1건의 시계열 |
 | `GET /api/validation/runs/{id}/video-metadata` , `/video` | 임무 영상 |
+| `GET /api/validation/runs/{id}/pointcloud` | 종료 실행의 Astrobee 맵 `.ply`; 없으면 404 |
 
 ### 읽기 캐시
 
@@ -99,14 +102,16 @@ mep_dashboard/
 │   ├── css/style.css
 │   └── js/
 │       ├── app.js          # 공통 차트 설정과 탭 전환
-│       ├── live.js         # LIVE 탭 (WebSocket 텔레메트리)
+│       ├── live.js         # LIVE 탭 (WebSocket 텔레메트리 + 맵 전달)
 │       ├── camera3.js      # Astrobee 카메라 폴링
+│       ├── map3d.js        # CAMERA 4 포인트 맵·도킹 통로 렌더링 (로컬 three.js)
 │       ├── firebase.js     # 서버 Firestore API 브라우저 클라이언트
-│       ├── validation.js   # VALIDATION 탭 (KPI·이력·그래프·영상)
+│       ├── validation.js   # VALIDATION 탭 (KPI·이력·그래프·영상·.ply 링크)
 │       ├── ui.js
-│       └── vendor/chart.umd.js
+│       └── vendor/         # 로컬 Chart.js, three.js
 ├── checks/
 │   ├── cache_check.py      # 캐시 동작 (Firestore 스텁, 네트워크 불필요)
+│   ├── map_check.py        # 맵 WebSocket·.ply·브라우저 스모크
 │   └── browser_check.py    # 브라우저 스모크 (playwright)
 ├── requirements.txt
 └── README.md
@@ -119,6 +124,8 @@ mep_dashboard/
 ```bash
 .venv/bin/python checks/cache_check.py     # 네트워크 없이 실행 가능
 ```
+
+`.venv/bin/python checks/map_check.py`는 ROS 2 없이 맵 WebSocket·`.ply`를 확인하고, Playwright Chromium이 설치돼 있으면 CAMERA 4 화면도 확인합니다.
 
 캐시 계층을 Firestore 스텁으로 검증합니다: 재조회 시 읽기 0건, 기록 중인 실행 캐시 제외,
 `is_running` 필드가 없는 과거 실행 캐시, 할당량 초과 시 캐시 폴백, 캐시가 없을 때 503 유지.

@@ -77,8 +77,8 @@ class AstrobeeMapCfg:
     # MEP meshes; a voxel within `model_dilate_voxels` of a sample is explained by the model
     model_sample_spacing_m: float = 0.015
     model_dilate_voxels: int = 1
-    # A confirmed obstruction stops the mission at once (DOCKING_UNAVAILABLE), whatever
-    # its phase; otherwise only the docking gates (before insertion / DOCK_READY) apply
+    # An observed corridor with confirmed obstruction stops the mission at once
+    # (DOCKING_UNAVAILABLE); an unobserved corridor waits for the insertion gate
     stop_mission_on_obstruction: bool = True
     # Obstruction voxels needed to declare DOCKING_UNAVAILABLE
     min_obstruction_voxels: int = 1

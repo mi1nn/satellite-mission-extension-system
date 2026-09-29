@@ -4,15 +4,15 @@ The Astrobee flies around the target satellite and keeps it -- and what happens 
 it (MRV, Canadarm3, MEP, docking) -- in the view of its camera. Outputs:
 
 - the camera feed (ROS 2 `sensor_msgs/Image`, `/<astrobee.ros_namespace>/<astrobee.image_topic>`)
-- a 3D point map of the satellite's outer shape (`astrobee_map.py`): a few times per
-  inspection-point dwell the depth image (`distance_to_image_plane`) is back-projected on
-  a pixel grid (dense around the docking port) with the camera pose it was rendered from
-  (`camera_world_pose`, no pose estimation), moved into the satellite frame and
-  accumulated in a 5 cm voxel grid
-- the docking clearance (`DockingClearance`): whether the free insertion corridor of the
-  thruster nozzle holds any foreign object. The mission (`vision_capture_demo.py`) reads
-  it in-process before DOCK_READY: an obstructed corridor sends it to DOCKING_UNAVAILABLE
-  instead (DOCKING_AVAILABLE is DOCK_READY entered with a clear corridor).
+- a 3D point map of the satellite's outer shape (`astrobee_map.py`): depth images
+  (`distance_to_image_plane`) are back-projected on a pixel grid (dense around the
+  docking port) with the camera pose they were rendered from (`camera_world_pose`,
+  no pose estimation), moved into the satellite frame and accumulated in a voxel grid
+  (3 cm with the default `vision_capture.yaml`)
+- the docking clearance (`DockingClearance`): whether the nozzle insertion corridor
+  holds a foreign object. The mission (`vision_capture_demo.py`) checks the result
+  in-process: confirmed obstruction stops it once the corridor has been observed;
+  an unobserved or blocked corridor also prevents insertion at the docking gate.
 
 What it does NOT do: no MEP search / capture, no AprilTag or marker detection, no pose
 estimation or vision tracking, no satellite state / angular-velocity estimate, no command

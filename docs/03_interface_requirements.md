@@ -29,8 +29,8 @@ flowchart LR
 | IR-08 | BR-05 | out | `/mrv/state`, `/mrv/captured`, `/mrv/status` | String/Bool/String JSON | 상태(latched), FixedJoint 여부, metrics/tags/standoff | 10 Hz |
 | IR-09 | BR-03 | out | `/tf` | `tf2_msgs/TFMessage` | `world → cylinder_est/cylinder_pred/ee/cam_wrist/cylinder_gt` | 10 Hz |
 | IR-10 | BR-04 | out | `/astrobee/camera/image_raw` | `sensor_msgs/Image` | 640×480 RGB8 관찰 영상 | 5 Hz |
-| IR-10a | BR-04 | out | `/astrobee/map/clearance` | `std_msgs/String` JSON (latched) | `is_clear`, `observed`, `status`(DOCKING_AVAILABLE/UNAVAILABLE), `obstruction_voxels`, `nearest_m` | depth 샘플마다 |
-| IR-10b | BR-04 | out | `/astrobee/map/points` | `sensor_msgs/PointCloud2` (latched) | 위성 프레임 보셀 중심 x,y,z + `obstruction`(1/0), frame `astrobee/satellite` | ≥5 s 간격 |
+| IR-10a | BR-04 | out | `/astrobee/map/clearance` | `std_msgs/String` JSON (latched) | `is_clear`, `observed`, `status`(DOCKING_AVAILABLE/UNAVAILABLE), `obstruction_voxels`, `nearest_m`, `zone`; 미관측은 `is_clear=false`, `observed=false` | depth 샘플마다 |
+| IR-10b | BR-04 | out | `/astrobee/map/points` | `sensor_msgs/PointCloud2` (latched) | 위성 프레임 보셀 중심 x,y,z + `obstruction`(1/0), frame `astrobee/satellite` | 변경 시 최소 2 s 발행 간격; 종료 시 최종 스냅샷 |
 | IR-11 | BR-05 | in | `/mrv/cmd/start`, `pause`, `resume`, `abort`, `reset` | `std_msgs/Empty` | 시작·일시정지·재개·안전 중단·초기화 | event |
 | IR-12 | BR-03 | in | `/mrv/cmd/capture_enable` | `std_msgs/Bool` | false면 추적만 하고 결합 금지 | event |
 
@@ -57,8 +57,10 @@ flowchart LR
 | IR-20 | BR-06 | `GET /api/validation/runs/{session_id}/video` | H.264 `.mp4` |
 | IR-21 | BR-05 | `GET /api/live/camera{1,2,3}.jpg`, `/api/live/viewport.jpg` | 최신 JPEG; ROS 없음은 204 |
 | IR-22 | BR-05 | `POST /api/live/command/{command}` | `start/pause/resume/abort`; 그 외 400, ROS 없음 503 |
+| IR-23 | BR-05 | `WS /ws/live` | ROS 상태 JSON, Astrobee 판정 JSON, `ABM1` 바이너리 맵 스냅샷(시퀀스·개수·float32 xyz·uint8 장애물 플래그) |
+| IR-24 | BR-06 | `GET /api/validation/runs/{session_id}/pointcloud` | 종료 세션 `.ply` 다운로드; 맵이 없으면 404 |
 
-근거: `mep_dashboard/backend/app.py:772-1050`. 브라우저는 LIVE에서 3 카메라·viewport·상태·7단계 진행률을, VALIDATION에서 성공률·정밀도·시간·시계열·영상 구간을 제공한다 (`README.md:154-160`).
+근거: `mep_dashboard/backend/app.py`, `mep_dashboard/frontend/js/map3d.js`, `project/scripts/firebase_bridge.py`. LIVE 화면은 뷰포트·카메라 3면 외에 Astrobee 포인트 맵(CAMERA 4), 장애물 점과 도킹 가능·불가·미관측 판정 및 7단계 진행률을 보여준다. VALIDATION은 성공률·정밀도·시간·영상 구간과 저장된 `.ply` 파일 다운로드를 제공한다. 안전 판정·중단은 웹이 아니라 시뮬레이터(`vision_capture_demo.py`)가 수행한다.
 
 ## 5. 파일·CLI 인터페이스
 

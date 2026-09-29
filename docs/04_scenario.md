@@ -1,6 +1,6 @@
 # 04. 전체 시나리오
 
-이 문서는 MRV, MEP, Client Satellite, Astrobee가 한 임무에서 수행하는 동작을 기술한다. 설정값은 `project/config/vision_capture.yaml`, 단계 표시는 `README.md:111-125`를 기준으로 한다. `설계값`은 실행 검증값이 아니다.
+이 문서는 MRV, MEP, Client Satellite, Astrobee가 한 임무에서 수행하는 동작을 기술한다. 설정값은 `project/config/vision_capture.yaml`, 단계 표시는 [README의 임무 7단계](../README.md#4-임무-7단계)를 기준으로 한다. `설계값`은 실행 검증값이 아니다.
 
 ## 1. 객체와 핵심 수치
 
@@ -9,7 +9,7 @@
 | MRV + Canadarm3 | MEP 포획·이송·분리 | 7-DoF; 시작 오프셋 [-5,0,-3] m; 이동 0.4 m/s, 가속 0.15 m/s²; 팔 전개 10 s (`yaml:232-289`) |
 | MEP | 수명연장 모듈 | 3,000 kg; 0.01 m/s; six_dof일 때 0.50°/s; AprilTag 4개 60 mm (`yaml:10-26,66-81`) |
 | Client Satellite | MEP 도킹 목표 | Ares1 probe를 추력기 노즐 내부 도킹점에 결합; 기본 정지, 이동 시 병진 표류만 검증 범위 (`yaml:307-322`) |
-| Astrobee | 관찰 카메라 + 위성 외형 맵·도킹 통로 판정 | collider 없음; 4방위 관측·각 5 s; 640×480/5 Hz; dwell당 depth 2회 → 5 cm 보셀 맵, 노즐 통로 이물질 시 `DOCKING_UNAVAILABLE` (`astrobee.map`) |
+| Astrobee | RGB 관측 + depth 포인트 맵·도킹 통로 판정 | collider 없음; 노즐 근접 관측점과 2개 고도 링, 링당 4방위(45/135/225/315°)·각 5 s; 640×480/5 Hz; dwell당 depth 3회 + 비행 중 1 s 간격 → 3 cm 보셀 맵 (`astrobee.map`) |
 
 ## 2. 전체 파이프라인
 
@@ -25,7 +25,7 @@ flowchart LR
 
 | UI 단계 | 내부 동작 | 진입 → 종료 조건 | 핵심 기준 |
 |---|---|---|---|
-| 1 | `MRV_APPROACH_STEP1/2`, `MRV_ARM_DEPLOY`; Astrobee 접근·관측 시작 | 시작 → MRV 목표 20 mm 이내·1 s settle, 팔 오차 0.1° 이내 | 2 leg, 각 상태 timeout 120 s; Astrobee ring margin 25 m |
+| 1 | `MRV_APPROACH_STEP1/2`, `MRV_ARM_DEPLOY`; Astrobee 접근·관측 시작 | 시작 → MRV 목표 20 mm 이내·1 s settle, 팔 오차 0.1° 이내 | 2 leg, 각 상태 timeout 120 s; Astrobee ring margin 5 m |
 | 2 | `SEARCH`, predicted-pose approach | tag constellation 발견 → 최종 standoff | vision 10 Hz, 예측 0.3 s, far/near/capture 0.10/0.04/0.01 m/s; approach timeout 60 s |
 | 3 | capture `FixedJoint`, `HOLDING` | 거리·각도·속도·횡오차 모두 만족 → 2 s 유지 | ≤150 mm, ≤5°, ≤0.05 m/s, ≤20 mm; holding drift ≤5 mm/0.5° |
 | 4 | `DOCK_TARGET_ACQUIRE`, `PRE_DOCK_APPROACH`, alignment | MEP를 1 m pre-dock pose로 이송 → 정렬 통과 | transport/approach 0.15 m/s, align 0.015 m/s·2°/s |
@@ -54,8 +54,9 @@ flowchart LR
 - depth camera는 640×480, 70°이며 노즐 축 거리의 물리 프레임 값과 차이가 150 mm를 넘으면 blind advance하지 않는다 (`yaml:388-408,418-430`).
 
 ### Astrobee
-- MRV/MEP/도킹 제어에 참여하지 않는다. 관찰 영상만 `/astrobee/camera/image_raw`로 낸다.
-- 위성 주변 45°, 135°, 225°, 315° 관측점을 순회하고 각 점에 5 s 체류한다. MRV 분리 단계에는 10 m standoff까지 3 m/s로 접근한다 (`yaml:583-610`).
+- 노즐 근접 관측점과 위·아래 링(각 4방위)을 순회하며 카메라 RGB(5 Hz)와 depth 샘플을 생성한다. 포즈는 시뮬레이터 값을 사용하며 별도 위치 추정은 하지 않는다. MRV 분리 단계에는 10 m standoff까지 3 m/s로 접근한다.
+- depth를 위성 좌표계로 역투영·3 cm 보셀화하고, 기존 위성/MEP 메시 표면과 일치하지 않는 점 중 노즐 내부·출구 앞 금지 구역의 확정 보셀을 장애물로 판정한다 (`astrobee.py`, `astrobee_map.py`). 노즐 부근 depth 관측 2회 이상 확인 후 확정 장애물이 있으면 즉시 `DOCKING_UNAVAILABLE`; 삽입 전에는 장애물 또는 관측 부족 모두 도킹을 막는다. 포획 pose 추정이나 팔 제어는 담당하지 않는다.
+- `/astrobee/camera/image_raw`, `/astrobee/map/clearance`, `/astrobee/map/points`로 관측 영상을 비롯한 판정과 맵을 보낸다.
 
 ## 4. 상호작용
 
@@ -69,6 +70,8 @@ sequenceDiagram
  W->>M: /mrv/cmd/start
  M->>A: observation start
  A-->>W: camera image (5 Hz)
+ A-->>W: /astrobee/map/clearance + /astrobee/map/points
+ A-->>M: 도킹 통로 판정 (프로세스 내부)
  M->>P: AprilTag detect / predicted intercept
  M->>P: capture FixedJoint
  M->>S: pre-dock alignment / insertion
@@ -87,7 +90,7 @@ sequenceDiagram
 | 도킹만 | `--dock_only` | MEP를 nominal grasp pose에 붙인 뒤 도킹 |
 | 정지 Client | `--no_moving_dock` | Client release 생략 |
 | MRV 접근 생략 | `--no_mrv_approach` | observation pose에서 시작 |
-| Astrobee 끔 | `--no_astrobee` | 관찰기만 제거 |
+| Astrobee 끔 | `--no_astrobee` | 관찰 영상·포인트 맵·도킹 통로 게이트 모두 생략 |
 
 ## 6. 확인된 결과와 한계
 

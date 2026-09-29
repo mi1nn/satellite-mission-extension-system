@@ -14,7 +14,7 @@
 
 **MRV가 표류·회전하는 3,000 kg MEP를 Canadarm3의 손목 카메라로 찾아 붙잡고, MEP 끝의 Ares1 probe를 표류하는 Client Satellite의 추력기 노즐에 삽입한 뒤, MEP를 위성에 남겨 두고 물러나는 임무를 Isaac Sim에서 실행하는 프로젝트입니다.**
 
-Astrobee는 이 작업을 제어하지 않고 주변을 비행하면서 카메라로 관찰합니다. ROS 2와 웹 대시보드는 임무를 시작·중지하고 상태, 영상, 오차, 실행 결과를 기록합니다.
+Astrobee는 포획이나 팔 제어에는 참여하지 않지만, RGB-D로 도킹 통로 주변 포인트 맵을 만들고 장애물/관측 부족 판정으로 도킹을 차단할 수 있습니다. ROS 2와 웹 대시보드는 임무를 시작·중지하고 상태, 영상, 오차, 실행 결과를 기록합니다.
 
 ```mermaid
 flowchart LR
@@ -24,8 +24,8 @@ flowchart LR
   MEP -->|Ares1 probe 삽입| SAT[Client Satellite]
   MEP -->|FixedJoint로 도킹| SAT
   MRV -->|포획 joint 해제·분리| SAT
-  AST[Astrobee] -.카메라 관찰.-> MRV
-  AST -.카메라 관찰.-> SAT
+  AST[Astrobee] -.RGB 영상·depth 맵.-> SAT
+  AST -.도킹 통로 안전 판정.-> MRV
 ```
 
 ---
@@ -263,28 +263,25 @@ Canadarm3 -- capture_joint -- MEP -- docking_joint -- Client Satellite
 
 ## 11. Astrobee는 무엇을 하고 무엇을 하지 않는가
 
-Astrobee는 위성 주변 관측점 4개(45°, 135°, 225°, 315°)를 순회하며 각 지점에 5 s 머뭅니다. 카메라는 640×480 영상을 5 Hz로 `/astrobee/camera/image_raw`에 발행합니다.
+Astrobee는 노즐 근접 관측점 1개와 위성 주변 위·아래 링의 4방위(45°, 135°, 225°, 315°)를 순회하며 각 지점에 5 s 머뭅니다. 카메라는 640×480 영상을 5 Hz로 `/astrobee/camera/image_raw`에 발행합니다.
 
 도킹 완료 상태를 받으면 관측 loop를 끝내고, 분리되는 MRV를 10 m 거리까지 따라갑니다 (`astrobee.py`).
 
 **위성 외형 맵과 도킹 가능 판정** (`astrobee_map.py`, 설정 `astrobee.map`):
 
-- 각 관측점 dwell 중 2회 depth(`distance_to_image_plane`)를 샘플링해 8 px 그리드(샘플마다 이동) + 도킹 포트 주변 전 픽셀을
-  역투영합니다. 카메라 포즈는 렌더에 쓴 `camera_world_pose`이며 포즈 추정은 없습니다.
-- 점은 위성 프레임으로 옮겨 5 cm 보셀에 누적하고(샘플당 +1), 카메라가 관통해 본 보셀은 −1로 지웁니다(free-space carving).
-  서비서 자신의 probe는 매핑하지 않습니다.
-- **장애물 판정 = 스캔 맵 − 기존 3D 모델.** 위성 USD 메시 표면을 2.5 cm 간격으로 샘플링한 모델 보셀(1보셀 팽창)로 설명되는
-  보셀은 위성 자체(노즐 벽·테두리 링·구조물)이고, 서비서 MEP(probe 포함)는 자기 모델로 매핑 단계에서 제외합니다.
-  남은 확정 보셀(2회 이상) 중 **도킹 금지 구역** 안에 있는 것이 장애물입니다.
+- 노즐 근접 관측점과 위·아래 2개 링(각 4방위)에서 dwell 중 3회, 비행 중 1 s 간격으로 depth(`distance_to_image_plane`)를 샘플링해 4 px 그리드(샘플마다 이동) + 도킹 포트 주변 전 픽셀을 역투영합니다. 카메라 포즈는 렌더에 쓴 `camera_world_pose`이며 포즈 추정은 없습니다.
+- 점은 위성 프레임으로 옮겨 3 cm 보셀에 누적하고(샘플당 +1), 카메라가 관통해 본 보셀은 −1로 지웁니다(free-space carving).
+  probe capsule과 MEP 메시 표면은 매핑에서 제외합니다.
+- **장애물 판정 = 확정 보셀 − 기존 3D 모델.** 위성 USD 메시 표면을 1.5 cm 간격으로 샘플링한 모델 보셀(1보셀 팽창)로 설명되는 점은 위성 자체입니다.
+  남은 확정 보셀(2회 이상 관측) 중 **도킹 금지 구역** 안에 있는 것이 장애물입니다. 장애물 보셀 한 개 이상이면 막힌 것으로 판정합니다.
 - **도킹 금지 구역(어디까지를 장애물로 볼지):** 노즐 안쪽(출구 ~ back plate 0.05 m 앞, 반경 = 내경 − 0.02 m) + 출구 앞
   1.0 m 길이(probe pre-dock 지점 너머)·반경 = 출구 반경 + 0.25 m 원기둥 (`astrobee.map.keepout_*`).
-- **판정 즉시 중단:** 장애물이 확정되면 미션이 어느 단계에 있든 즉시 `DOCKING_UNAVAILABLE`(도킹 불가 최종 판정)로 전이하고
-  로봇은 그 자리에 정지합니다(`stop_mission_on_obstruction`). 시작 전(INIT)·종료 후·도킹 완료 후·도킹 없는 실행은 제외.
-  구역을 2회 이상 보지 못한 채 삽입(`ALIGNMENT_CHECK → Z_APPROACH`)이나 `DOCK_READY`에 도달해도 `DOCKING_UNAVAILABLE`입니다.
-  `DOCKING_AVAILABLE`은 판정을 통과한 `DOCK_READY` 진입 자체입니다. `--nozzle_obstruction`은 도킹부 앞에 떠다니는
+- **관측 후 즉시 중단:** depth 프레임 2개 이상이 노즐 부근을 충분히 본 뒤(`min_corridor_views=2`), 위성 모델로 설명되지 않는 확정 장애물이 있으면 도킹 전 진행 중인 임무를 `DOCKING_UNAVAILABLE`로 중단하고 로봇을 정지시킵니다(`stop_mission_on_obstruction`). 관측이 부족할 때는 장애물 보셀이 있어도 이 조기 중단은 하지 않습니다. 시작 전(INIT)·종료 후·도킹 완료 후·도킹 없는 실행도 제외합니다.
+  삽입 전(`ALIGNMENT_CHECK → Z_APPROACH`) 또는 `DOCK_READY` 게이트에서는 관측 부족과 장애물 모두 `DOCKING_UNAVAILABLE`로 막습니다.
+  `DOCKING_AVAILABLE`은 통로 판정을 통과했다는 상태 표시로, 별도의 궤도 이송이나 성공 보장은 아닙니다. `--nozzle_obstruction`은 도킹부 앞에 떠다니는
   부유물(시각 전용, 메시가 아닌 Cube라 모델에 없음)을 둡니다.
-- 웹: 멈춘 단계를 유지한 채 MISSION STATE에 `DOCKING UNAVAILABLE`(빨강)과 중단 사유, CAMERA 4 맵에 금지 구역 윤곽
-  (가능 청록/불가 빨강)과 장애물 보셀(빨강)을 표시합니다.
+- 웹: LIVE의 MISSION STATE는 실패 단계를 유지하고 `DOCKING UNAVAILABLE`과 실제 중단 사유(장애물/미관측)를 보여줍니다. CAMERA 3은 RGB 영상, CAMERA 4는 ROS 2 `PointCloud2`를 WebSocket 바이너리로 받아 3D 맵·금지 구역 윤곽(가능 청록/불가 빨강)·장애물 보셀(빨강)을 그립니다. 통로를 충분히 보지 못한 상태는 `NOT OBSERVED`로 표시합니다.
+  VALIDATION에서는 브리지가 종료 세션에 저장한 `.ply` 포인트 맵을 내려받습니다. ROS 2와 웹은 판정 결과를 표시할 뿐, 안전 게이트 자체는 시뮬레이터 안에서 실행됩니다.
 - 관측점: 약 40 m 링에서는 노즐 안이 보이지 않습니다(MEP가 도킹 축 위에 있고, 위성 구조물이 아래·옆을 가림). 그래서 첫 관측점은
   노즐 출구에서 12 m, 축에서 45°, 축 위쪽의 도킹 포트 근접 관측점입니다(`astrobee.dock_view_*`).
 
@@ -315,10 +312,10 @@ flowchart LR
 - `/mrv/cam_wrist/image_raw`: 포획 카메라
 - `/mrv/dock/*`: probe와 dock pose
 - `/astrobee/camera/image_raw`: 관찰 카메라
-- `/astrobee/map/clearance`, `/astrobee/map/points`: 도킹 통로 판정(JSON), 위성 맵 스냅샷(PointCloud2, 5 s 이상 간격)
+- `/astrobee/map/clearance`, `/astrobee/map/points`: 도킹 통로 판정(JSON, depth 샘플마다), 위성 프레임 보셀(PointCloud2, 변경 시 최대 2 s 간격)
 - `/mrv/cmd/start|pause|resume|abort`: 운영 명령
 
-Firestore는 실행 요약과 기본 5 Hz telemetry를 저장합니다. 웹 LIVE 탭은 ROS 실시간 값을, VALIDATION 탭은 저장된 실행의 성공률·정밀도·임무 시간·영상 구간을 보여줍니다. 자세한 계약은 [03_interface_requirements.md](03_interface_requirements.md)에 있습니다.
+Firestore는 실행 요약과 기본 5 Hz telemetry를 저장합니다. 웹 LIVE 탭은 ROS 실시간 값과 CAMERA 4의 포인트 맵을, VALIDATION 탭은 저장된 실행의 성공률·정밀도·임무 시간·영상 구간 및 세션 `.ply` 다운로드를 제공합니다. 자세한 계약은 [03_interface_requirements.md](03_interface_requirements.md)에 있습니다.
 
 ---
 
@@ -412,8 +409,8 @@ legacy는 연속 감속과 corridor rollback으로 일부 개념만 반영합니
 7. `docking.py` — USD 메시에서 docking frame 추출, MEP–Satellite FixedJoint
 8. `probe_dock.py` — 정렬·depth·결합 조건
 9. `moving_dock.py` — Client release, 상대속도 정합, 분리
-10. `astrobee.py` — 관찰 경로와 ROS 영상
-11. `ros_interface.py` → `firebase_bridge.py` → `mep_dashboard/` — 운영·기록·시각화
+10. `astrobee.py`, `astrobee_map.py` — RGB-D 스캔·보셀 누적·도킹 통로 판정
+11. `ros_interface.py` → `firebase_bridge.py` → `mep_dashboard/backend/app.py` → `frontend/js/map3d.js` — 운영·기록·포인트 맵 시각화
 
 ## 15. 현재 한계
 

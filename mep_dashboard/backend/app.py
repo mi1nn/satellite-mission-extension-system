@@ -353,6 +353,7 @@ def normalize_live_status(raw: dict, last_progress: "int | None" = None):
         "source": "ros2:/mrv/status",
         "sim_time_s": finite_number(raw.get("sim_time_s")),
         "state": state,
+        "failure": str(raw.get("failure") or "") if state == "DOCKING_UNAVAILABLE" else "",
         "phase": phase,
         "progress": progress,
         "total_steps": TOTAL_STAGES,

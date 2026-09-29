@@ -234,7 +234,9 @@ button:focus-visible{outline:2px solid var(--cyan)}
 .eyebrow{color:var(--muted);letter-spacing:2.4px}
 .state{font-family:var(--font-wide);font-size:22px;letter-spacing:1px;color:var(--text)}
 .state.state-failure{color:var(--red)}
+.state.state-docking-unavailable{font-size:clamp(12px,1vw,15px)}
 .phase{color:var(--muted)}
+.phase.docking-reason{font-size:10px;line-height:1.2;overflow-wrap:anywhere}
 .telemetry>div{border-bottom:1px solid var(--line)}
 .telemetry dt{color:var(--muted)}
 .telemetry dt span{display:grid;place-items:center;width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.06);border:1px solid var(--line);font-size:18px;color:var(--cyan)}

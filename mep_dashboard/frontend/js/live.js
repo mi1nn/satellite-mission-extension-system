@@ -229,13 +229,16 @@ window.initLive = function () {
     setConnection(connected);
     setProgress(data.progress, data.total_steps);
 
-    // The Astrobee found the docking port blocked: the mission stopped where it was
+    // A blocked corridor and one that was never observed both stop docking.
     const dockingUnavailable = data.state === 'DOCKING_UNAVAILABLE';
+    const failure = data.failure || '';
     stateEl.textContent = dockingUnavailable ? 'DOCKING UNAVAILABLE' : (data.phase || 'WAITING');
     stateEl.classList.toggle('state-failure', Boolean(data.is_failure));
+    stateEl.classList.toggle('state-docking-unavailable', dockingUnavailable);
     phaseEl.textContent = dockingUnavailable
-      ? 'ASTROBEE: DOCKING PORT BLOCKED'
-      : (connected ? "ROS2 LIVE TELEMETRY" : "WAITING FOR ROS2");
+      ? (failure.replace(/^DOCKING_UNAVAILABLE:\s*/, '') || 'ASTROBEE: DOCKING CLEARANCE FAILED')
+      : (connected ? 'ROS2 LIVE TELEMETRY' : 'WAITING FOR ROS2');
+    phaseEl.classList.toggle('docking-reason', dockingUnavailable);
 
     document.getElementById('mission-time').textContent =
       formatTime(data.sim_time_s);

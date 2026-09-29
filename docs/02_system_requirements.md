@@ -34,8 +34,8 @@ flowchart LR
 | SR-F-04 | BR-01 | MRV가 2구간으로 접근하고 팔을 전개한다. | 시작 오프셋 [-5,0,-3] m, 0.4 m/s, 0.15 m/s², 위치 공차 20 mm, 전개 10 s | `vision_capture.yaml:232-289`, `mrv_approach.py` |
 | SR-F-05 | BR-01/08 | Ares1 probe를 Client 노즐에 정렬·삽입하고 `FixedJoint`를 만든다. | 축/반경 ≤40 mm, 축각 ≤2°, roll ≤4°, 상대속도 ≤0.05 m/s, hold 3 s | `vision_capture.yaml:307-416`, `probe_dock.py`, `docking.py` |
 | SR-F-06 | BR-02 | 이동 Client 도킹을 지원한다. | Client 기본값은 정지; 동적 시나리오는 병진 표류만 검증 범위 | `moving_dock.py`, `vision_capture.py:61-66` |
-| SR-F-07 | BR-04 | Astrobee를 관찰 전용 객체로 운용한다. | 640×480, 5 Hz; 4 관측 방위(45/135/225/315°), 각 5 s; collider 없음 | `vision_capture.yaml:562-612`, `astrobee.py` |
-| SR-F-08 | BR-05 | 웹이 실시간 상태·카메라를 표시하고 임무 명령을 전달한다. | `start/pause/resume/abort` 4종; 7단계 진행률 | `mep_dashboard/backend/app.py:1038-1050`, `README.md:111-125` |
+| SR-F-07 | BR-04 | Astrobee로 RGB 관측·depth 기반 위성 포인트 맵 및 도킹 통로 안전 판정을 수행한다. | 640×480, RGB 5 Hz; 노즐 근접 관측점 + 2개 고도 링(각 4방위, 5 s 체류); 3 cm 보셀, 확정 2회, 통로 관측 2회 미만이면 삽입 금지; collider 없음 | `vision_capture.yaml:562-681`, `astrobee.py`, `astrobee_map.py`, `test_astrobee_map.py` |
+| SR-F-08 | BR-05 | 웹이 실시간 상태·카메라·Astrobee 3D 맵을 표시하고 임무 명령을 전달한다. | `start/pause/resume/abort` 4종; 7단계 진행률(7단계 미구현), 맵 장애물·미관측·도킹 판정 | `mep_dashboard/backend/app.py`, `frontend/js/map3d.js`, `README.md` |
 | SR-F-09 | BR-06 | 실행 요약과 시계열을 저장·재생한다. | `simulation_sessions/{id}` + telemetry; GUI 영상 `.mp4`와 `t0_sim_s` sidecar | `firebase_bridge.py`, `README.md:129-152` |
 | SR-F-10 | BR-07 | YAML/CLI로 시나리오를 재현한다. | `--set SECTION.KEY=VALUE`, `--headless`, `--dock_only`, `--no_dock` 등 | `vision_capture.py:47-81` |
 
@@ -53,7 +53,7 @@ flowchart LR
 
 ## 4. 상태 요구사항
 
-임무는 `MRV_APPROACH_* → SEARCH → APPROACH/CAPTURE/HOLDING → PRE_DOCK_APPROACH → ALIGNMENT_CHECK → Z_APPROACH → FINAL_INSERTION → DOCK_READY → STABILIZING/RELEASE/SEPARATION` 순으로 실행한다. 각 단계는 조건 실패·timeout·abort에서 `FAILED` 또는 `ABORTED`로 끝나며, UI에는 실패가 발생한 임무 단계(1–6)를 유지한다. 7단계 `ORBIT TRANSFER`는 표시 전용이며 미구현이다 (`README.md:111-125`).
+임무는 `MRV_APPROACH_* → SEARCH → APPROACH/CAPTURE/HOLDING → PRE_DOCK_APPROACH → ALIGNMENT_CHECK → Z_APPROACH → FINAL_INSERTION → DOCK_READY → STABILIZING/RELEASE/SEPARATION` 순으로 실행한다. Astrobee 맵의 장애물은 통로 관측 2회 이상 확인 후 도킹 전 진행 중인 임무를 즉시 `DOCKING_UNAVAILABLE`로 종료한다. 삽입 전 게이트에서는 장애물이나 미관측 상태 모두 같은 실패 상태로 종료한다. UI에는 중단이 발생한 단계(1–6)를 유지한다. 7단계 `ORBIT TRANSFER`는 표시 전용이며 미구현이다 ([README](../README.md#4-임무-7단계)).
 
 ## 5. 추적성
 
