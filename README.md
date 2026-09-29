@@ -1,41 +1,25 @@
-<h1 align="center">Space Robotics Bench</h1>
+## 20. `feature/web-v2`
 
-<p align="center">
-  <a href="https://AndrejOrsula.github.io/space_robotics_bench"><img alt="" src="https://github.com/user-attachments/assets/049289be-0c99-497b-be37-c4975d924524" width="100%"></a>
-</p>
+### 이슈와 수정
 
-[![Discord](https://img.shields.io/badge/Discord-invite-5865F2?logo=discord)](https://discord.gg/p9gZAPWa65)
-[![Docs](https://img.shields.io/badge/docs-online-blue?logo=markdown)](https://AndrejOrsula.github.io/space_robotics_bench)
-[![Rust](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/rust.yml/badge.svg)](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/rust.yml)
-[![Python](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/python.yml/badge.svg)](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/python.yml)
-[![Docker](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/docker.yml/badge.svg)](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/docker.yml)
-[![Docs](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/docs.yml/badge.svg)](https://github.com/AndrejOrsula/space_robotics_bench/actions/workflows/docs.yml)
+- 기존 `feature/web`의 대시보드와 `feature/integration`의 시뮬레이션 파이프라인을 이어받았다. 이 브랜치의 변경(`9cbe505`, `a42e396`)은 별도로 ROS 2→Firestore 기록과 웹 화면을 연결하고, 대시보드 디자인·검증 화면·구간 영상 재생을 개편한 것이다.
+- `project/scripts/firebase_bridge.py`가 ROS 2 상태·pose·카메라 메시지를 세션 요약과 시계열로 기록한다. `mep_dashboard/backend/app.py`는 Firestore 실행 목록/telemetry, `/ws/live` ROS 2 실시간 상태, 카메라 JPEG 및 실행별 MP4를 제공한다. 검증 화면은 실행 구간과 영상 시각을 맞춰 재생한다. 실행 영상은 `<session_id>.mp4`와 `<session_id>.video.json`이 있을 때만 표시된다.
+- 이 브랜치의 `backend/app.py`는 실행 영상 기본 위치가 `/home/rokey/space_robotics_bench/project/logs/vision_capture`이므로 다른 설치 경로에서는 `MRV_RUN_VIDEO_DIR`을 지정해야 한다. `mep_dashboard/README.md`의 mock 전용 설명은 현재 웹 구현과 맞지 않는다.
 
-<!-- [![Codecov](https://codecov.io/gh/AndrejOrsula/space_robotics_bench/graph/badge.svg)](https://codecov.io/gh/AndrejOrsula/space_robotics_bench) -->
+### 실행 명령
 
-**Space Robotics Bench (SRB)** is a comprehensive collection of environments and tasks for robotics research in the challenging domain of space. It provides a unified framework for developing and validating autonomous systems under diverse extraterrestrial scenarios. At the same time, its design is flexible and extensible to accommodate a variety of development workflows and research directions beyond Earth.
+저장소 루트에서 대시보드 실행(로컬 Python에 FastAPI·Uvicorn·Pillow·NumPy 설치 필요):
 
-## Key Features
+```bash
+cd mep_dashboard
+python3 -m venv --system-site-packages .venv
+.venv/bin/python -m pip install -r requirements.txt
+MRV_RUN_VIDEO_DIR="$(pwd)/../project/logs/vision_capture" .venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
+```
 
-- **Parallelized Simulation**: Highly parallelized simulation instances for accelerated workflows
-- **Procedural Generation**: On-demand generation of diverse simulation assets and scenes
-- **Domain Randomization**: Extensive randomization for robustness and generalization
-- **Gymnasium API**: Compatibility with standard API and frameworks for robot learning
-- **ROS 2 Interface**: Seamless interoperability with ROS 2 and Space ROS ecosystems
-- **Abstract Architecture**: Flexibility across different robots and space domains
+`http://127.0.0.1:8000` 및 `/health` 확인. ROS 2 라이브 구독에는 실행 전에 ROS 2 환경을 source하고 시뮬레이터와 `ROS_DOMAIN_ID`를 맞춘다. Firestore 실데이터에는 `FIREBASE_CREDENTIALS` 또는 `GOOGLE_APPLICATION_CREDENTIALS`(또는 emulator)가 필요하다. 기록 브리지는 별도 ROS 2 환경의 저장소 루트에서 `python3 project/scripts/firebase_bridge.py --dry_run`으로 쓰기 예정 메시지를 확인할 수 있다(실제 ROS 토픽이 있어야 출력됨).
 
-## Documentation
+### 결과
 
-SRB documentation with detailed installation instructions, usage guides, and development resources is available [online](https://AndrejOrsula.github.io/space_robotics_bench).
-
-<div align="right">
-<a href="https://AndrejOrsula.github.io/space_robotics_bench"><img alt="Documentation" src="https://github.com/user-attachments/assets/c8663796-3ef1-4ff7-860b-cf8080d0a07a" width="96" height="96"></a>
-</div>
-
-## License
-
-This project is dual-licensed under either the [MIT](project/LICENSE-MIT) or [Apache 2.0](project/LICENSE-APACHE) licenses.
-
-All assets created by contributors of this repository and those generated from [SimForge](https://github.com/AndrejOrsula/simforge) procedural pipelines are licensed under the [CC0 1.0 Universal](https://github.com/AndrejOrsula/srb_assets/blob/main/LICENSE-CC0) license. Resources from third-party sources are listed under [attributions](https://andrejorsula.github.io/space_robotics_bench/misc/attributions.html).
-
-[![CC0 1.0 Universal](https://licensebuttons.net/l/zero/1.0/88x31.png)](https://creativecommons.org/publicdomain/zero/1.0)
+- 코드에서 확인: 실데이터 API·라이브 WebSocket·실행별 비디오 메타데이터/파일 경로와 구간 seek가 구현되어 있다. `stage_for_state`는 1~6단계만 실제 상태에 매핑하며 7단계 orbit transfer는 미구현이다.
+- 미검증: 이 문서 작업에서 Isaac Sim, ROS 2, Firestore 연동이나 브라우저 재생을 실행하지 않았다. `checks/browser_check.py`는 실제 Firestore 실행 기록과 Chromium/Playwright가 있어야 의미 있는 검증이 된다.
