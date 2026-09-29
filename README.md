@@ -21,8 +21,8 @@
 </p>
 
 <p align="center">
-  <img src ="./docs/image/mep_흡착.gif" width="330"> <img src ="./docs/image/docking.gif" width="320">    
-  <img src ="./docs/image/git_web.gif" width="330"> <img src ="./docs/image/pointcloud.gif" width="320"> 
+  <img src ="./docs/image/mep_흡착.gif" width="350"> <img src ="./docs/image/docking.gif" width="350">    
+  <img src ="./docs/image/git_web.gif" width="350"> <img src ="./docs/image/pointcloud.gif" width="350"> 
 </p>
 
 ## 0. 시스템 개요
