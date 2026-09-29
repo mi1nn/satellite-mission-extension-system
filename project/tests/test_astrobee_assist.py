@@ -90,6 +90,85 @@ def test_scaled_thrust_damps_the_measured_swing():
     assert 0.2 * none < real_astrobee < 0.8 * none
 
 
+## Lateral centering
+
+
+def test_lateral_error_is_perpendicular_to_the_docking_axis():
+    e = aa.lateral_error_to_axis(tip=[0.3, -0.05, -1.0], axis_point=[0.0, 0.0, 0.0], axis_dir=[0.0, 0.0, 2.0])
+    assert np.allclose(e, [-0.3, 0.05, 0.0])
+
+
+def test_centering_force_points_at_the_axis_and_fades_out_far_away():
+    f = aa.centering_force([0.0, 0.02, 0.0], gain=200.0, radius=0.3)
+    assert np.allclose(f, [0.0, 4.0, 0.0])
+    half = aa.centering_force([0.0, 0.45, 0.0], gain=200.0, radius=0.3)
+    assert np.allclose(half, 0.5 * 200.0 * np.array([0.0, 0.45, 0.0]))
+    assert np.allclose(aa.centering_force([0.0, 4.8, 0.0], gain=200.0, radius=0.3), 0.0)  # pre-dock transport
+
+
+def test_damping_keeps_priority_on_the_thrust_budget():
+    cfg = _cfg()
+    # damper alone saturates: no centering left
+    f = aa.assist_force([0.0, 0.0, 0.1], [0.0, 0.0, 0.0], [0.0, 0.1, 0.0], cfg)
+    assert np.allclose(f, [0.0, 0.0, -cfg.max_force_n])
+    # at rest: centering only, clipped to F_max, towards the axis
+    f = aa.assist_force(np.zeros(3), np.zeros(3), [0.0, 0.1, 0.0], cfg)
+    assert np.allclose(f, [0.0, cfg.max_force_n, 0.0])
+    # no docking axis: damping only
+    assert np.allclose(aa.assist_force(np.zeros(3), np.zeros(3), None, cfg), 0.0)
+
+
+def _static_offset(cfg, disturbance_n=-14.8, mass=3000.0, period_s=20.0, zeta=0.01, t_end=400.0):
+    """1-D lateral (world Y) arm + payload mode pushed off the axis by a constant force
+    (the -Y lean: 14.8 N = 50 mm on the ~296 N/m mode), with the assist on it."""
+    w = 2.0 * math.pi / period_s
+    k, c0 = mass * w * w, 2.0 * zeta * mass * w
+    y, v = 0.0, 0.0
+    for _ in range(int(t_end / DT)):
+        f = float(aa.assist_force([0, v, 0], [0, 0, 0], [0, -y, 0], cfg)[1])
+        v += (-k * y - c0 * v + disturbance_n + f) / mass * DT
+        y += v * DT
+    return y
+
+
+def test_centering_reduces_a_static_minus_y_offset():
+    none = -14.8 / (3000.0 * (2.0 * math.pi / 20.0) ** 2)  # static offset without the assist
+    damping_only = _static_offset(_cfg(centering_gain_n_per_m=0.0))
+    centered = _static_offset(_cfg())
+    assert none == pytest.approx(-0.05, abs=1e-3)
+    assert damping_only == pytest.approx(none, abs=1e-3)  # a damper cannot move a static offset
+    # F_max = 5 N on k ~ 296 N/m: the offset shrinks by ~17 mm, towards the axis
+    assert centered - none == pytest.approx(aa.AstrobeeAssistCfg().max_force_n / 296.1, abs=2e-3)
+    assert none < centered < 0.0
+
+
+def test_planner_centering_never_pushes_along_the_docking_axis():
+    mep = _Mep()
+    assist = aa.DampingAssist(_cfg())
+    pos, vel = np.array([25.0, 15.0, 10.0]), np.zeros(3)
+    grip_in_mep = aa.grip_point_in_mep(mep.tip, mep.dir, mep.length, assist.cfg.grip_fraction_from_root)
+    axis = np.array([0.0, 0.0, 1.0])  # docking axis along the probe (world Z here)
+    t, pushed = 0.0, False
+    while t < 130.0:
+        state = "HOLDING" if t < 60.0 else "POSITION_ATTITUDE_ALIGN"
+        tip = mep.frame(t).point(mep.tip)
+        # docking axis 30 mm to -Y of the swing centre, drifting along with the MEP (client)
+        lateral = aa.lateral_error_to_axis(tip, mep.v * t + np.array([0.0, -0.03, 0.0]), axis)
+        ctx = aa.MepContext(mep=mep.frame(t), grip_in_mep=grip_in_mep, axis_in_mep=mep.dir,
+                            grip_velocity=mep.velocity(t), reference_velocity=mep.velocity(t),
+                            tip_lateral_error=lateral)
+        out = assist.step(t, DT, state, pos, vel, ctx)
+        if out is not None:
+            vel, pos = (out.pos - pos) / DT, out.pos
+            if out.force_w is not None:
+                assert abs(float(out.force_w @ axis)) < 1e-9
+                assert float(np.linalg.norm(out.force_w)) <= assist.cfg.max_force_n + 1e-9
+                assert float(out.force_w @ lateral) >= 0.0
+                pushed = pushed or float(np.linalg.norm(out.force_w)) > 1.0
+        t += DT
+    assert assist.summary()["damping_time_s"] > 60.0 and pushed
+
+
 ## Config
 
 
@@ -104,6 +183,8 @@ def test_assist_is_off_by_default_and_loads_from_yaml():
 @pytest.mark.parametrize("override", [
     "astrobee.assist.max_force_n=0.0",
     "astrobee.assist.damping_n_s_per_m=-1.0",
+    "astrobee.assist.centering_gain_n_per_m=-1.0",
+    "astrobee.assist.centering_radius_m=0.0",
     "astrobee.assist.grip_fraction_from_root=1.5",
     "astrobee.assist.final_approach_speed_mps=0.0",
     "astrobee.assist.max_accel_mps2=0.0",

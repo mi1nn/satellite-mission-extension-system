@@ -21,7 +21,7 @@ Sequence (one shot per run; `DampingAssist.step`):
                                     (`standby_distance_m`, perpendicular to the probe)
     ASTROBEE_ASSIST_FINAL_APPROACH  close in slowly to `grip_standoff_m`, velocity matched
     ASTROBEE_ASSIST_GRASPED         attached, no thrust (mission not in a damping state yet)
-    ASTROBEE_DAMPING_ASSIST         attached, F = clip(-c (v_grip - v_ref), F_max)
+    ASTROBEE_DAMPING_ASSIST         attached, F = damping + lateral centering (`assist_force`)
     ASTROBEE_ASSIST_RELEASE         let go and back off to the standby distance
     ASTROBEE_ASSIST_STANDBY         hold beside the MEP (camera on the probe)
 
@@ -42,6 +42,13 @@ Model (simplifications, all deliberate):
   The Astrobee's own mass (~10 kg vs 3000 kg) is neglected.
 - v_ref is the arm reference velocity at the grip point, so only the deviation from the
   commanded motion (the swing) is damped, never the approach itself.
+- Lateral centering: a damper cannot remove a *static* offset of the probe tip from the
+  docking axis (e.g. the tip settling to -Y of the axis at the pre-dock pose while it
+  aligns). F_c = k e_lat pushes the MEP towards the axis, perpendicular to it only (never
+  along the insertion direction), and only within `centering_radius_m` of the axis (faded
+  out to 2x), so the long pre-dock transport is left to the arm. The damper has priority
+  on the thrust budget: F_c only gets F_max - |F_damp|. At the arm + payload stiffness
+  (~296 N/m) F_max = 5 N moves a static offset by at most ~17 mm.
 
 Frames: world W (Z up, metres, m/s, N). MEP body frame M as `docking.py` (probe tip and
 direction in M). Pure numpy (`project/tests/test_astrobee_assist.py`).
@@ -93,6 +100,12 @@ class AstrobeeAssistCfg:
     # Damper gain c [N s/m]: F = -c (v_grip - v_ref). 300 adds a damping ratio of
     # c / (2 m w) = 0.16 on the 3 t, 20 s mode and saturates F_max at 0.017 m/s
     damping_n_s_per_m: float = 300.0
+    # Lateral centering gain k [N/m] on the probe-tip offset from the docking axis
+    # (perpendicular component only; 0 disables). 200 reaches F_max = 5 N at 25 mm and
+    # adds 200 N/m to the ~296 N/m mode (damping ratio of c then ~0.12)
+    centering_gain_n_per_m: float = 200.0
+    # Full gain within this lateral offset [m], faded linearly to 0 at twice it
+    centering_radius_m: float = 0.3
     # Grip point on the probe rod: 0 = root (MEP body side), 1 = tip
     grip_fraction_from_root: float = 0.15
     # Astrobee body centre to grip point once grasped [m] (display-scaled model + arm)
@@ -127,6 +140,8 @@ class AstrobeeAssistCfg:
 def validate_assist_cfg(cfg: AstrobeeAssistCfg):
     if cfg.max_force_n <= 0.0 or cfg.damping_n_s_per_m < 0.0:
         raise ValueError("astrobee.assist.max_force_n must be > 0 and damping_n_s_per_m >= 0")
+    if cfg.centering_gain_n_per_m < 0.0 or cfg.centering_radius_m <= 0.0:
+        raise ValueError("astrobee.assist.centering_gain_n_per_m must be >= 0 and centering_radius_m > 0")
     if not 0.0 <= cfg.grip_fraction_from_root <= 1.0:
         raise ValueError("astrobee.assist.grip_fraction_from_root must be in [0, 1]")
     if cfg.grip_standoff_m <= 0.0 or cfg.standby_distance_m <= cfg.grip_standoff_m or cfg.standby_tolerance_m <= 0.0:
@@ -161,6 +176,34 @@ def damping_force(grip_velocity, reference_velocity, damping: float, max_force: 
     on the deviation of the grip point from the arm's commanded motion."""
     err = np.asarray(grip_velocity, dtype=float) - np.asarray(reference_velocity, dtype=float)
     return clip_norm(-float(damping) * err, float(max_force))
+
+
+def centering_force(lateral_error, gain: float, radius: float) -> np.ndarray:
+    """F_c = k e_lat [N, world], e_lat = probe tip -> docking axis, perpendicular to the
+    axis [m]. Full gain within `radius`, linear fade to 0 at 2 * `radius` (unclipped)."""
+    e = np.asarray(lateral_error, dtype=float)
+    n = float(np.linalg.norm(e))
+    fade = min(1.0, max(0.0, 2.0 - n / float(radius)))
+    return float(gain) * fade * e
+
+
+def assist_force(grip_velocity, reference_velocity, lateral_error, cfg: AstrobeeAssistCfg) -> np.ndarray:
+    """Damping + lateral centering [N, world], |F| <= F_max; the damper keeps priority
+    (the centering term only gets the thrust the damper leaves). `lateral_error` None:
+    damping only."""
+    f = damping_force(grip_velocity, reference_velocity, cfg.damping_n_s_per_m, cfg.max_force_n)
+    if lateral_error is None or cfg.centering_gain_n_per_m <= 0.0:
+        return f
+    left = max(0.0, cfg.max_force_n - float(np.linalg.norm(f)))
+    return f + clip_norm(centering_force(lateral_error, cfg.centering_gain_n_per_m, cfg.centering_radius_m), left)
+
+
+def lateral_error_to_axis(tip, axis_point, axis_dir) -> np.ndarray:
+    """Vector from `tip` to the nearest point of the line (`axis_point`, `axis_dir`),
+    i.e. the component of (axis_point - tip) perpendicular to the axis [m]."""
+    a = np.asarray(axis_dir, dtype=float) / np.linalg.norm(axis_dir)
+    d = np.asarray(axis_point, dtype=float) - np.asarray(tip, dtype=float)
+    return d - float(d @ a) * a
 
 
 def grip_point_in_mep(tip, direction, length: float, fraction_from_root: float) -> np.ndarray:
@@ -200,6 +243,9 @@ class MepContext:
     axis_in_mep: np.ndarray  # probe direction (unit), MEP frame
     grip_velocity: np.ndarray  # measured velocity of the grip point [m/s]
     reference_velocity: np.ndarray  # arm reference velocity at the grip point [m/s]
+    # probe tip -> docking axis, perpendicular to the axis [m] (`lateral_error_to_axis`);
+    # None = no docking axis this step: damping only
+    tip_lateral_error: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -280,8 +326,9 @@ class DampingAssist:
             pos = self._side_point(ctx, c.grip_standoff_m)
             self._vel = np.asarray(ctx.grip_velocity, dtype=float).copy()
             if mission_state in c.damping_states:
-                self._goto("ASTROBEE_DAMPING_ASSIST", t, f"F_max {c.max_force_n:g} N, c {c.damping_n_s_per_m:g} N s/m")
-                force = damping_force(ctx.grip_velocity, ctx.reference_velocity, c.damping_n_s_per_m, c.max_force_n)
+                self._goto("ASTROBEE_DAMPING_ASSIST", t, f"F_max {c.max_force_n:g} N, c {c.damping_n_s_per_m:g} N s/m, "
+                                                         f"centering {c.centering_gain_n_per_m:g} N/m")
+                force = assist_force(ctx.grip_velocity, ctx.reference_velocity, ctx.tip_lateral_error, c)
                 err = np.asarray(ctx.grip_velocity, dtype=float) - np.asarray(ctx.reference_velocity, dtype=float)
                 f = float(np.linalg.norm(force))
                 self._damping_s += dt
@@ -305,6 +352,7 @@ class DampingAssist:
             "enabled": bool(self.cfg.enabled),
             "max_force_limit_n": self.cfg.max_force_n,
             "damping_n_s_per_m": self.cfg.damping_n_s_per_m,
+            "centering_gain_n_per_m": self.cfg.centering_gain_n_per_m,
             "final_phase": self.phase,
             "grasped": self._t_grasp is not None,
             "grasp_time_s": self._t_grasp,

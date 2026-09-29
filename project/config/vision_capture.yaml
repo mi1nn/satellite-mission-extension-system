@@ -681,6 +681,12 @@ astrobee:
     max_force_n: 5.0
     # [N s/m]; 300 adds ~0.16 damping ratio on the 3 t, 20 s mode
     damping_n_s_per_m: 300.0
+    # Lateral centering [N/m]: pushes the probe tip back onto the docking axis (perpendicular
+    # to it only) against a static offset such as the -Y lean at the pre-dock pose; 0 = off.
+    # Full gain within centering_radius_m of the axis, faded to 0 at twice it. The damper
+    # keeps priority on max_force_n; 5 N shifts a static offset by at most ~17 mm
+    centering_gain_n_per_m: 200.0
+    centering_radius_m: 0.3
     # Grip point on the rod: 0 = root (MEP body side), 1 = tip
     grip_fraction_from_root: 0.15
     grip_standoff_m: 1.0

@@ -1376,16 +1376,22 @@ class VisionCaptureDemo:
         states, so an engaged assist sees them and lets go of the probe."""
         if self.astrobee is None or self.astrobee.assist is None:
             return None
-        from .astrobee_assist import MepContext, grip_point_in_mep
+        from .astrobee_assist import MepContext, grip_point_in_mep, lateral_error_to_axis
 
         pr = self.geo.probe
         grip_in_mep = grip_point_in_mep(pr.tip, pr.direction, pr.length, self.cfg.astrobee.assist.grip_fraction_from_root)
         mep = self.mep_frame()
         grip = mep.point(grip_in_mep)
         v_ref, w_ref = self._ee_ref_twist
+        # Lateral centering (docking states only): probe tip -> docking axis (dock frame +Z)
+        lateral = None
+        if self.state in DOCKING_STATES:
+            dock = self.dock_world()
+            lateral = lateral_error_to_axis(self.probe_world().pos, dock.pos, dock.rot[:, 2])
         return MepContext(mep=mep, grip_in_mep=grip_in_mep, axis_in_mep=np.asarray(pr.direction, dtype=float),
                           grip_velocity=self.gt_mep_velocity_at(grip)[0],
-                          reference_velocity=v_ref + np.cross(w_ref, grip - self.arm.tool_pose().pos))
+                          reference_velocity=v_ref + np.cross(w_ref, grip - self.arm.tool_pose().pos),
+                          tip_lateral_error=lateral)
 
     def apply_assist_thrust(self):
         """Astrobee thrust on the MEP at the grip point: force at the COM + r x F torque."""
