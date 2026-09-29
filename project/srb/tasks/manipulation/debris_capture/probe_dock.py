@@ -204,7 +204,7 @@ def validate_probe_camera_cfg(cfg: ProbeCameraCfg):
         raise ValueError("probe_camera.offset_from_tip_m must be >= 0 (in front of the tip)")
 
 
-PHASES = ("MEP_CAPTURED", "DOCK_TARGET_ACQUIRE", "PRE_DOCK_APPROACH", "XY_ALIGN",
+PHASES = ("MEP_CAPTURED", "DOCK_TARGET_ACQUIRE", "PRE_DOCK_APPROACH", "XY_ALIGN", "POSITION_ATTITUDE_ALIGN",
           "ORIENTATION_ALIGN", "ALIGNMENT_CHECK", "Z_APPROACH", "FINAL_INSERTION",
           "DOCK_READY", "DOCKED", "DOCK_HOLDING")
 

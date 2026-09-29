@@ -415,6 +415,64 @@ docking:
   phase_timeout_s: 600.0
   hold_duration_s: 3.0
 
+docking_control:
+  # Docking controller (`coupled_dock.py`). Both modes log `<run>_docking_control.csv` and
+  # `metrics.docking_control` in the result JSON, so runs from the same start compare.
+  #   legacy             : verified sequential XY_ALIGN -> ORIENTATION_ALIGN -> ALIGNMENT_CHECK
+  #                        (timer + settle window) -> Z_APPROACH with the corridor hard gate
+  #   coupled_predictive : POSITION_ATTITUDE_ALIGN -> ALIGNMENT_CHECK (conditions held for
+  #                        docking_alignment.stable_duration_sec) -> Z_APPROACH, tracking the
+  #                        client's predicted docking pose with position and attitude together,
+  #                        soft approach gate + emergency hard stop + rollback hysteresis
+  #                        NEEDS_ISAAC_VALIDATION: gains checked on a 1-D payload-mode model only
+  #   --set docking_control.mode=coupled_predictive
+  mode: legacy
+  # Client-motion prediction horizon [s] (constant linear + angular velocity about its CoM)
+  prediction_horizon_sec: 0.3
+  # v_cmd = v_target + clip(Kp e_p) - Kd v_rel ;  w_cmd = w_client + clip(Kp e_R) - Kd w_rel
+  kp_position_hz: 0.15
+  kd_position: 0.6
+  kp_attitude_hz: 0.15
+  kd_attitude: 0.6
+  # far-away alignment speed is about max_correction_speed / (1 + kd_position): 0.015 gave
+  # ~7 mm/s in Isaac (2026-09-23). 0.03 on the 1-D payload model: gate pass 41 -> 27 s, no
+  # re-exit of the 50 mm band, same residual. NEEDS_ISAAC_VALIDATION (0.025 if rollbacks)
+  max_correction_speed_mps: 0.03
+  max_correction_rate_deg_s: 2.0
+  max_accel_mps2: 0.01
+  max_angular_accel_deg_s2: 1.0
+  # 0: P term on the commanded tip pose (stable on the ~20 s arm + payload mode); >0 blends
+  # the measured tip pose in (limit-cycles on the model without enough Kd)
+  tip_feedback_weight: 0.0
+  max_reference_lead_m: 0.10
+  max_reference_lead_deg: 5.0
+  max_axial_lead_m: 0.05
+  # inside the nozzle (a set point far ahead of a blocked tip pushes the client and the MRV
+  # station keeping follows); DOCK_READY freezes the set point at the tip
+  max_axial_lead_inside_m: 0.01
+  # Soft gate: approach speed x 1 below the full_* errors, x 0 at the zero_* errors
+  soft_gate_full_position_m: 0.01
+  soft_gate_zero_position_m: 0.08
+  soft_gate_full_orientation_deg: 1.0
+  soft_gate_zero_orientation_deg: 7.0
+  # Emergency hard stop (unsafe state): stop the approach at once and re-align
+  hard_stop_position_m: 0.15
+  hard_stop_orientation_deg: 12.0
+  hard_stop_relative_speed_mps: 0.10
+
+docking_alignment:
+  # coupled_predictive only. Z_APPROACH starts once all four hold for stable_duration_sec
+  # (lateral = probe tip off the docking axis, orientation = full 3-axis angle incl. roll)
+  position_threshold_m: 0.05
+  orientation_threshold_deg: 4.0
+  relative_velocity_threshold_mps: 0.02
+  relative_angular_velocity_threshold_deg_s: 1.0
+  stable_duration_sec: 0.5
+  # Hysteresis: back to POSITION_ATTITUDE_ALIGN only above these (entry < rollback <= hard stop)
+  rollback_position_m: 0.08
+  rollback_orientation_deg: 7.0
+  rollback_hold_sec: 0.2
+
 probe_camera:
   # RGB-D camera on the Ares1 probe, used by the docking phase. It sits on the probe
   # axis `offset_from_tip_m` in front of the tip, looking along the insertion

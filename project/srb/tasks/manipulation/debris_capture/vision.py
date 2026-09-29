@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .astrobee import AstrobeeCfg, validate_astrobee_cfg
+from .coupled_dock import DockingAlignmentCfg, DockingControlCfg, validate_docking_control_cfg
 from .frames import Frame, rotation_angle
 from .moving_dock import (
     ClientMotionCfg,
@@ -278,6 +279,10 @@ class VisionCaptureConfig:
     mrv: MrvApproachCfg = field(default_factory=MrvApproachCfg)
     # Ares1 probe -> satellite thruster docking phase (`probe_dock.py`)
     docking: DockingVisionCfg = field(default_factory=DockingVisionCfg)
+    # Docking controller selection (`coupled_dock.py`): legacy (default, the verified
+    # sequential alignment) or coupled_predictive, and the latter's alignment gate
+    docking_control: DockingControlCfg = field(default_factory=DockingControlCfg)
+    docking_alignment: DockingAlignmentCfg = field(default_factory=DockingAlignmentCfg)
     # RGB-D camera on the Ares1 probe (docking phase)
     probe_camera: ProbeCameraCfg = field(default_factory=ProbeCameraCfg)
     # Moving-client scenario (`moving_dock.py`): client release -> chase -> velocity
@@ -353,6 +358,7 @@ def load_vision_config(path: Optional[str | Path] = None, overrides: Sequence[st
                          "(the estimate would always be rejected)")
     validate_mrv_cfg(cfg.mrv)
     validate_docking_cfg(cfg.docking)
+    validate_docking_control_cfg(cfg.docking_control, cfg.docking_alignment)
     validate_probe_camera_cfg(cfg.probe_camera)
     validate_moving_cfg(cfg.client, cfg.rendezvous, cfg.post_docking, cfg.separation)
     validate_astrobee_cfg(cfg.astrobee)
