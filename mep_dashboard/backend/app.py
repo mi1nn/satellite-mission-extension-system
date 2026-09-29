@@ -46,6 +46,13 @@ CACHE_ROOT = Path(
 RUNS_CACHE_TTL_S = float(os.environ.get("MEP_DASHBOARD_RUNS_TTL_S", "60"))
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 IMAGE_STALE_TIMEOUT_S = 3.0
+# Astrobee satellite map (/astrobee/map/points, /astrobee/map/clearance): latched,
+# low-rate topics. The web gets the snapshot as one binary WS frame (see
+# `encode_map_frame`); larger maps are thinned (obstruction voxels always kept).
+ASTROBEE_MAP_POINTS_TOPIC = "/astrobee/map/points"
+ASTROBEE_MAP_CLEARANCE_TOPIC = "/astrobee/map/clearance"
+MAP_MAX_POINTS = 250_000
+MAP_FRAME_MAGIC = b"ABM1"
 
 app = FastAPI(
     title="MEP Dashboard · Firestore Validation + ROS2 Live",
@@ -240,7 +247,7 @@ FAILURE_STAGE = {
 # Any state where the dock_* fields (rather than the capture gt_* fields)
 # are the meaningful telemetry to show.
 DOCKING_PHASE_STATES = STAGE4_STATES | STAGE5_STATES | STAGE6_STATES | {
-    "DOCK_FAILED",
+    "DOCK_FAILED", "DOCKING_UNAVAILABLE",
     "CLIENT_RELEASE_FAILED", "VELOCITY_MATCH_TIMEOUT", "RENDEZVOUS_TIMEOUT",
     "STOP_FAILED", "ROBOT_RELEASE_FAILED", "ARM_RETREAT_FAILED",
     "SEPARATION_COLLISION", "SEPARATION_FAILED",
@@ -276,7 +283,9 @@ def stage_for_state(state: str, dock_enabled: bool, last_progress: "int | None")
         # a docking run ends at stage 6.
         stage = 6 if dock_enabled else 3
         return stage, STAGE_LABELS[stage], False
-    if state == "ABORTED":
+    # Stopped wherever the mission was: a manual abort, or the Astrobee finding the
+    # docking port blocked (it can stop any phase) -- keep the stage it stopped in
+    if state in ("ABORTED", "DOCKING_UNAVAILABLE"):
         stage = last_progress or 1
         return stage, STAGE_LABELS.get(stage, STAGE_LABELS[1]), True
     if state in FAILURE_STAGE:
@@ -358,14 +367,47 @@ def normalize_live_status(raw: dict, last_progress: "int | None" = None):
     }
 
 
+def cloud_to_arrays(msg):
+    """(N, 3) float32 xyz and (N,) bool obstruction flags of a PointCloud2 with float32
+    x, y, z (+ optional `obstruction`) fields."""
+    offsets = {f.name: f.offset for f in msg.fields}
+    n = int(msg.width) * int(msg.height)
+    raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)[: n * msg.point_step].reshape(n, msg.point_step)
+
+    def column(name):
+        return raw[:, offsets[name]:offsets[name] + 4].copy().view("<f4")[:, 0]
+
+    xyz = np.column_stack([column(k) for k in ("x", "y", "z")]).astype("<f4")
+    flags = column("obstruction") > 0.5 if "obstruction" in offsets else np.zeros(n, dtype=bool)
+    ok = np.isfinite(xyz).all(axis=1)
+    return xyz[ok], flags[ok]
+
+
+def encode_map_frame(seq: int, xyz, flags, max_points: int = MAP_MAX_POINTS) -> bytes:
+    """Binary WS frame of a map snapshot (little endian):
+    b"ABM1", uint32 seq, uint32 n, float32 xyz[n * 3], uint8 obstruction[n].
+    Above `max_points` the free voxels are thinned evenly; obstruction voxels stay."""
+    xyz = np.asarray(xyz, dtype="<f4").reshape(-1, 3)
+    flags = np.asarray(flags, dtype=bool).reshape(-1)
+    if len(xyz) > max_points:
+        hit = np.flatnonzero(flags)
+        free = np.flatnonzero(~flags)
+        keep = max(0, max_points - len(hit))
+        free = free[np.linspace(0, len(free) - 1, keep).astype(np.int64)] if keep and len(free) else free[:0]
+        idx = np.sort(np.concatenate((hit, free)))
+        xyz, flags = xyz[idx], flags[idx]
+    header = MAP_FRAME_MAGIC + np.array([seq, len(xyz)], dtype="<u4").tobytes()
+    return header + xyz.tobytes() + flags.astype(np.uint8).tobytes()
+
+
 class RosLiveBridge:
     def __init__(self):
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         from std_msgs.msg import Empty, String
-        from sensor_msgs.msg import Image
-        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+        from sensor_msgs.msg import Image, PointCloud2
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 
         self.rclpy = rclpy
         self.Empty = Empty
@@ -392,6 +434,15 @@ class RosLiveBridge:
         self._camera3_seq = 0
         self._camera3_last_rx = 0.0
         self._camera3_last_encode = 0.0
+
+        # Astrobee satellite map: latest snapshot (binary WS frame) and clearance.
+        self._map_frame = None
+        self._map_seq = 0
+        self._map_points = 0
+        self._map_status = None
+        self._map_status_seq = 0
+        self._last_sim_time = None
+        self._map_last_rx = 0.0
 
         # Main Isaac Sim 3D viewport (API capture, not screen share).
         self._viewport_jpeg = None
@@ -448,6 +499,32 @@ class RosLiveBridge:
             viewport_sensor_qos,
         )
 
+        # Same QoS as the Astrobee publishers (latched): a late start gets the latest.
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        # The map snapshot is a large message: a node + executor thread of its own, so
+        # taking / converting it never holds up the camera and viewport image callbacks
+        self.map_node = Node("mep_dashboard_map_bridge")
+
+        self.map_node.create_subscription(
+            PointCloud2,
+            ASTROBEE_MAP_POINTS_TOPIC,
+            self._map_points_callback,
+            map_qos,
+        )
+
+        self.map_node.create_subscription(
+            String,
+            ASTROBEE_MAP_CLEARANCE_TOPIC,
+            self._map_clearance_callback,
+            map_qos,
+        )
+
         self.start_pub = self.node.create_publisher(
             Empty,
             "/mrv/cmd/start",
@@ -483,6 +560,17 @@ class RosLiveBridge:
 
         self.thread.start()
 
+        self.map_executor = SingleThreadedExecutor()
+        self.map_executor.add_node(self.map_node)
+
+        self.map_thread = threading.Thread(
+            target=self._spin_map,
+            name="mep-dashboard-ros2-map",
+            daemon=True,
+        )
+
+        self.map_thread.start()
+
         print(
             "[LIVE] ROS2 bridge started: "
             "/mrv/status -> /ws/live",
@@ -498,10 +586,74 @@ class RosLiveBridge:
             print(f"[LIVE] invalid /mrv/status: {exc}", flush=True)
             return
 
+        sim_time = finite_number(raw.get("sim_time_s"))
+
         with self._lock:
             self._seq += 1
             self._latest = payload
+            # A new run (the simulator clock went back): the previous run's map must not
+            # be shown as if it were already scanned -- start the map view empty
+            if sim_time is not None and self._last_sim_time is not None and sim_time < self._last_sim_time - 1.0:
+                self._reset_map_locked()
+            if sim_time is not None:
+                self._last_sim_time = sim_time
 
+
+    def _map_points_callback(self, msg):
+        """Astrobee map snapshot (a few seconds apart) -> one binary WS frame."""
+        try:
+            xyz, flags = cloud_to_arrays(msg)
+        except Exception as exc:
+            print(f"[LIVE] invalid {ASTROBEE_MAP_POINTS_TOPIC}: {exc}", flush=True)
+            return
+
+        with self._lock:
+            self._map_last_rx = time.monotonic()
+            self._map_seq += 1
+            self._map_points = int(len(xyz))
+            self._map_frame = encode_map_frame(self._map_seq, xyz, flags)
+
+    def _reset_map_locked(self):
+        """Empty map snapshot + no clearance (caller holds the lock)."""
+        self._map_seq += 1
+        self._map_points = 0
+        self._map_frame = encode_map_frame(self._map_seq, np.zeros((0, 3)), np.zeros(0, dtype=bool))
+        self._map_status_seq += 1
+        self._map_status = {"reset": True}
+        print("[LIVE] new run: Astrobee map view cleared", flush=True)
+
+    def _map_clearance_callback(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except ValueError as exc:
+            print(f"[LIVE] invalid {ASTROBEE_MAP_CLEARANCE_TOPIC}: {exc}", flush=True)
+            return
+
+        with self._lock:
+            self._map_last_rx = time.monotonic()
+            self._map_status_seq += 1
+            self._map_status = status
+
+    def map_status(self):
+        """(seq, `astrobee_map` field of the WS payload or None)."""
+        with self._lock:
+            if self._map_status is None and self._map_frame is None:
+                return self._map_status_seq, None
+            return self._map_status_seq, {
+                **(self._map_status or {}),
+                "points": self._map_points,
+                "map_seq": self._map_seq,
+            }
+
+    def astrobee_alive(self) -> bool:
+        """The Astrobee is streaming: its camera image (5 Hz) or a map message arrived
+        within `IMAGE_STALE_TIMEOUT_S` (the map alone can be quiet for a few seconds)."""
+        last = max(self._camera3_last_rx, self._map_last_rx)
+        return last > 0.0 and time.monotonic() - last <= IMAGE_STALE_TIMEOUT_S
+
+    def map_frame(self):
+        with self._lock:
+            return self._map_seq, self._map_frame
 
     @staticmethod
     def _decode_ros_image_to_jpeg(msg, tag: str):
@@ -677,13 +829,24 @@ class RosLiveBridge:
             if self._running and self.rclpy.ok():
                 print(f"[LIVE] ROS2 executor stopped: {type(exc).__name__}: {exc}", flush=True)
 
+    def _spin_map(self):
+        try:
+            while self._running and self.rclpy.ok():
+                self.map_executor.spin_once(timeout_sec=0.2)
+        except Exception as exc:
+            if self._running and self.rclpy.ok():
+                print(f"[LIVE] ROS2 map executor stopped: {type(exc).__name__}: {exc}", flush=True)
+
     def snapshot(self):
+        _, astrobee_map = self.map_status()
+
         with self._lock:
-            return self._seq, (
-                dict(self._latest)
-                if self._latest is not None
-                else None
-            )
+            payload = dict(self._latest) if self._latest is not None else None
+
+            if payload is not None and astrobee_map is not None:
+                payload["astrobee_map"] = astrobee_map
+
+            return self._seq, payload
 
     def command(self, command: str):
         if command == "start":
@@ -711,20 +874,22 @@ class RosLiveBridge:
     def shutdown(self):
         self._running = False
 
-        try:
-            self.thread.join(timeout=2.0)
-        except Exception:
-            pass
+        for thread in (self.thread, self.map_thread):
+            try:
+                thread.join(timeout=2.0)
+            except Exception:
+                pass
 
-        try:
-            self.executor.remove_node(self.node)
-        except Exception:
-            pass
+        for executor, node in ((self.executor, self.node), (self.map_executor, self.map_node)):
+            try:
+                executor.remove_node(node)
+            except Exception:
+                pass
 
-        try:
-            self.node.destroy_node()
-        except Exception:
-            pass
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
 
         if self._owns_context and self.rclpy.ok():
             self.rclpy.shutdown()
@@ -766,7 +931,9 @@ def stop_live_ros():
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(FRONTEND / "index.html")
+    # Always revalidated: the page pins its CSS/JS versions (`?v=`), so a stale copy of
+    # it would keep serving old assets after a frontend change
+    return FileResponse(FRONTEND / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/health")
@@ -949,6 +1116,35 @@ def validation_video(session_id: str):
     )
 
 
+def find_run_pointcloud(session_id: str):
+    """`<id>.ply` (firebase_bridge.py session map), next to the session video."""
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        return None
+
+    candidate = (RUN_VIDEO_ROOT / f"{session_id}.ply").resolve()
+    if candidate.parent == RUN_VIDEO_ROOT and candidate.is_file():
+        return candidate
+
+    return None
+
+
+@app.api_route("/api/validation/runs/{session_id}/pointcloud", methods=["GET", "HEAD"])
+def validation_pointcloud(session_id: str):
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+
+    ply = find_run_pointcloud(session_id)
+    if ply is None:
+        raise HTTPException(status_code=404, detail="Run point cloud not available")
+
+    return FileResponse(
+        ply,
+        media_type="application/octet-stream",
+        filename=f"{session_id}_astrobee_map.ply",
+        headers={"Cache-Control": "private, max-age=0, must-revalidate"},
+    )
+
+
 @app.get("/api/live/camera2.jpg")
 def camera2_jpeg():
     if live_ros is None:
@@ -1074,6 +1270,9 @@ async def live_websocket(websocket: WebSocket):
     await websocket.accept()
 
     last_seq = -1
+    last_map_seq = 0
+    last_map_status_seq = 0
+    last_alive = None
     heartbeat = 0
 
     try:
@@ -1109,6 +1308,27 @@ async def live_websocket(websocket: WebSocket):
                 elif seq != last_seq:
                     last_seq = seq
                     await websocket.send_json(payload)
+
+                # Astrobee map: the clearance as a JSON message of its own (it changes
+                # without /mrv/status too), the snapshot as one binary frame per update
+                map_status_seq, astrobee_map = live_ros.map_status()
+
+                if astrobee_map is not None and map_status_seq != last_map_status_seq:
+                    last_map_status_seq = map_status_seq
+                    await websocket.send_json({"type": "astrobee_map", "astrobee_map": astrobee_map})
+
+                # CAMERA 4 liveness (LIVE / WAITING), sent when it changes
+                alive = live_ros.astrobee_alive()
+
+                if alive != last_alive:
+                    last_alive = alive
+                    await websocket.send_json({"type": "astrobee_map", "astrobee_map": {"alive": alive}})
+
+                map_seq, frame = live_ros.map_frame()
+
+                if frame is not None and map_seq != last_map_seq:
+                    last_map_seq = map_seq
+                    await websocket.send_bytes(frame)
 
             await asyncio.sleep(0.1)
 

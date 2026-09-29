@@ -1,13 +1,22 @@
-"""Astrobee free-flyer: satellite observation / monitoring camera platform.
+"""Astrobee free-flyer: satellite observation camera + satellite-shape map / docking clearance.
 
 The Astrobee flies around the target satellite and keeps it -- and what happens around
-it (MRV, Canadarm3, MEP, docking) -- in the view of its camera. That camera feed is its
-only output (ROS 2 `sensor_msgs/Image`, `/<astrobee.ros_namespace>/<astrobee.image_topic>`).
+it (MRV, Canadarm3, MEP, docking) -- in the view of its camera. Outputs:
+
+- the camera feed (ROS 2 `sensor_msgs/Image`, `/<astrobee.ros_namespace>/<astrobee.image_topic>`)
+- a 3D point map of the satellite's outer shape (`astrobee_map.py`): a few times per
+  inspection-point dwell the depth image (`distance_to_image_plane`) is back-projected on
+  a pixel grid (dense around the docking port) with the camera pose it was rendered from
+  (`camera_world_pose`, no pose estimation), moved into the satellite frame and
+  accumulated in a 5 cm voxel grid
+- the docking clearance (`DockingClearance`): whether the free insertion corridor of the
+  thruster nozzle holds any foreign object. The mission (`vision_capture_demo.py`) reads
+  it in-process before DOCK_READY: an obstructed corridor sends it to DOCKING_UNAVAILABLE
+  instead (DOCKING_AVAILABLE is DOCK_READY entered with a clear corridor).
 
 What it does NOT do: no MEP search / capture, no AprilTag or marker detection, no pose
-estimation or vision tracking, no satellite state / angular-velocity estimate, no docking
-feasibility (no DOCKING_AVAILABLE / DOCKING_UNAVAILABLE), no mission decision, no command
-to the Canadarm3 / MEP / docking pipeline. Nothing it does feeds back into the mission.
+estimation or vision tracking, no satellite state / angular-velocity estimate, no command
+to the Canadarm3 / MEP / docking pipeline. The clearance is its only feedback to the mission.
 
 The one input it reacts to (`follow_mrv_after_dock`): the mission state on the existing
 latched MRV topic `/<ros.namespace>/state` (std_msgs/String, `ros_interface.py`; with
@@ -19,7 +28,8 @@ its camera onto the MRV / docking port (ASTROBEE_FOLLOW_MRV).
 Motion: a simplified, kinematic 6-DoF flight (no propulsion, drag or gravity model; the
 model is visual only -- no rigid body, no collider, so it cannot touch the scene). The
 path is anchored at the satellite's *simulation* pose (ground truth, only to place the
-path; it is not measured, estimated or published):
+path and to express the map in the satellite frame; it is not measured, estimated or
+published):
 
     ASTROBEE_IDLE (start_delay_s) -> ASTROBEE_APPROACH (straight in to point 1)
     -> ASTROBEE_OBSERVATION_START -> ASTROBEE_OBSERVING (dwell at each inspection point,
@@ -34,10 +44,12 @@ forward, +Y starboard, +Z down, origin at the body centre. The camera sits at th
 mount of the NASA geometry config (`sci_cam_transform`, B frame, scaled with the model)
 and looks along +X_B. Quaternions are (w, x, y, z).
 
-The planner below is pure numpy (`project/tests/test_astrobee_observer.py`); the Isaac Sim
-side (`AstrobeeObserver`) imports Isaac Lab / rclpy lazily.
+The planner below and the map (`astrobee_map.py`) are pure numpy
+(`project/tests/test_astrobee_observer.py`, `test_astrobee_map.py`); the Isaac Sim side
+(`AstrobeeObserver`) imports Isaac Lab / rclpy lazily.
 """
 
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +57,20 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .astrobee_map import (
+    AstrobeeMapCfg,
+    DockingClearance,
+    DockingCorridor,
+    ModelMask,
+    SatelliteMap,
+    depth_frame_points,
+    evaluate_clearance,
+    sample_triangles,
+    sphere_roi,
+    transform,
+    validate_map_cfg,
+    write_ply,
+)
 from .frames import Frame
 
 ASTROBEE_STATES = (
@@ -87,7 +113,7 @@ CAM_IN_BODY_QUAT = (0.0, 1.0, 0.0, 0.0)
 
 @dataclass
 class AstrobeeCameraCfg:
-    """RGB observation camera on the Astrobee (monitoring feed only, never processed)."""
+    """Observation camera on the Astrobee: RGB feed + depth for the map (`AstrobeeMapCfg`)."""
 
     name: str = "cam_astrobee"
     width: int = 640
@@ -124,14 +150,26 @@ class AstrobeeCfg:
     start_delay_s: float = 0.0
     approach_distance_m: float = 20.0
     approach_speed_mps: float = 1.0
-    orbit_margin_m: float = 25.0
+    orbit_margin_m: float = 5.0
     elevation_deg: float = 25.0
     # Inspection points, azimuth [deg] about world +Z measured from the horizontal
     # direction satellite centre -> docking port (0 = straight in front of the port,
     # where the MRV / MEP come in). Visited in list order, always turning the same way.
     inspection_azimuths_deg: List[float] = field(default_factory=lambda: [45.0, 135.0, 225.0, 315.0])
+    # Scan rings: one lap over the inspection azimuths per elevation [deg], in this order
+    # (e.g. above, then below the satellite), so the map covers the whole satellite.
+    # Empty: a single ring at `elevation_deg`
+    scan_elevations_deg: List[float] = field(default_factory=list)
     dwell_s: float = 5.0
-    transit_speed_mps: float = 2.0
+    transit_speed_mps: float = 1.0
+    # First inspection point: a close-up of the docking port for the map, `distance_m`
+    # from the nozzle exit, `off_axis_deg` from its axis, `roll_deg` about it (90 =
+    # above). The ring (~40 m) does not see into the nozzle: the MEP sits on the
+    # docking axis and the satellite's own structure hides it from below / the side.
+    dock_view_point: bool = True
+    dock_view_distance_m: float = 12.0
+    dock_view_off_axis_deg: float = 45.0
+    dock_view_roll_deg: float = 90.0
     # Camera aim: 0 = satellite centre, 1 = docking port; in between keeps the satellite
     # and the docking area (MEP / MRV side) in the same view
     look_at_dock_weight: float = 0.5
@@ -154,6 +192,8 @@ class AstrobeeCfg:
     ros_node_name: str = "astrobee_observer"
     image_topic: str = "camera/image_raw"
     camera: AstrobeeCameraCfg = field(default_factory=AstrobeeCameraCfg)
+    # Satellite-shape map + docking clearance (`astrobee_map.py`)
+    map: AstrobeeMapCfg = field(default_factory=AstrobeeMapCfg)
 
 
 def validate_astrobee_cfg(cfg: AstrobeeCfg):
@@ -168,12 +208,16 @@ def validate_astrobee_cfg(cfg: AstrobeeCfg):
         raise ValueError("astrobee.look_at_dock_weight must be in [0, 1]")
     if not -80.0 <= cfg.elevation_deg <= 80.0:
         raise ValueError("astrobee.elevation_deg must be in [-80, 80]")
+    if any(not -80.0 <= float(e) <= 80.0 for e in cfg.scan_elevations_deg):
+        raise ValueError("astrobee.scan_elevations_deg must all be in [-80, 80]")
     if len(cfg.inspection_azimuths_deg) < 1:
         raise ValueError("astrobee.inspection_azimuths_deg needs at least one point")
     if cfg.follow_aim_blend_s < 0.0:
         raise ValueError("astrobee.follow_aim_blend_s must be >= 0")
     if cfg.follow_close_speed_mps < 0.0 or cfg.follow_close_accel_mps2 <= 0.0 or cfg.follow_standoff_m < 0.0:
         raise ValueError("astrobee.follow_close_speed_mps / follow_standoff_m must be >= 0, follow_close_accel_mps2 > 0")
+    if cfg.dock_view_distance_m <= 0.0 or not 0.0 <= cfg.dock_view_off_axis_deg < 90.0:
+        raise ValueError("astrobee.dock_view_distance_m must be > 0 and dock_view_off_axis_deg in [0, 90)")
     if int(cfg.loops) < 0:
         raise ValueError("astrobee.loops must be >= 0 (0 = forever)")
     if not cfg.ros_namespace.strip("/") or not cfg.image_topic.strip("/"):
@@ -191,6 +235,7 @@ def validate_astrobee_cfg(cfg: AstrobeeCfg):
         raise ValueError("astrobee.camera.publish_rate_hz must be > 0 and save_every_s >= 0")
     if len(c.mount_pos_body_m) != 3:
         raise ValueError("astrobee.camera.mount_pos_body_m must be [x, y, z]")
+    validate_map_cfg(cfg.map)
 
 
 ###############
@@ -226,9 +271,14 @@ class ObservationPath:
 
     Pure function of time, so the flight is smooth and repeatable; the satellite's own
     translation / rotation is added by the caller (`center_w`), never predicted here.
+    Inspection points are (azimuth, height, radius) about the centre, on the ring except
+    `dock_view` = (azimuth [rad], height [m], horizontal radius [m]), prepended as the
+    first point (`dock_view_offset`). `aim_weight(t)`: the camera aim between centre (0)
+    and docking port (1), 1 at the docking-port point, blended in the transits.
     """
 
-    def __init__(self, cfg: AstrobeeCfg, ring_radius_m: float, ref_dir_w):
+    def __init__(self, cfg: AstrobeeCfg, ring_radius_m: float, ref_dir_w,
+                 dock_view: Optional[Tuple[float, float, float]] = None):
         self.cfg = cfg
         self.r = float(ring_radius_m)
         u = np.asarray(ref_dir_w, dtype=float).copy()
@@ -238,25 +288,70 @@ class ObservationPath:
         self.u = u / np.linalg.norm(u)
         self.v = np.cross([0.0, 0.0, 1.0], self.u)
         self.h = self.r * math.tan(math.radians(cfg.elevation_deg))
-        az = [math.radians(a) for a in cfg.inspection_azimuths_deg]
-        self.az = az
+        elevations = list(cfg.scan_elevations_deg) or [cfg.elevation_deg]
+        az, hs, self.labels = [], [], []
+        for el in elevations:
+            for a in cfg.inspection_azimuths_deg:
+                az.append(math.radians(a))
+                hs.append(self.r * math.tan(math.radians(el)))
+                self.labels.append(f"azimuth {a:g} deg" + (f", elevation {el:g} deg" if len(elevations) > 1 else ""))
+        rs = [self.r] * len(az)
+        ws = [float(cfg.look_at_dock_weight)] * len(az)
+        if dock_view is not None:
+            az.insert(0, float(dock_view[0]))
+            hs.insert(0, float(dock_view[1]))
+            rs.insert(0, float(dock_view[2]))
+            ws.insert(0, 1.0)
+            self.labels.insert(0, "docking port close-up")
+        self.az, self.hs, self.rs, self.ws = az, hs, rs, ws
         # Signed steps between consecutive points, always turning the same way (+)
         self.steps = [((az[(i + 1) % len(az)] - az[i]) % (2.0 * math.pi)) or (2.0 * math.pi if len(az) == 1 else 0.0)
                       for i in range(len(az))]
-        self.transit_s = [self.r * s / cfg.transit_speed_mps for s in self.steps]
+        nxt = [(i + 1) % len(az) for i in range(len(az))]
+        self.transit_s = [math.sqrt((0.5 * (rs[i] + rs[j]) * st) ** 2 + (hs[j] - hs[i]) ** 2 + (rs[j] - rs[i]) ** 2)
+                          / cfg.transit_speed_mps for i, (j, st) in enumerate(zip(nxt, self.steps))]
         self.leg_s = [cfg.dwell_s + t for t in self.transit_s]
         self.loop_s = sum(self.leg_s)
         self.approach_s = cfg.approach_distance_m / cfg.approach_speed_mps
         self.observe_t0 = cfg.start_delay_s + self.approach_s
 
-    def ring_point(self, azimuth_rad: float) -> np.ndarray:
-        return self.r * (math.cos(azimuth_rad) * self.u + math.sin(azimuth_rad) * self.v) + np.array([0.0, 0.0, self.h])
+    def ring_point(self, azimuth_rad: float, height_m: Optional[float] = None, radius_m: Optional[float] = None) -> np.ndarray:
+        h = self.h if height_m is None else height_m
+        r = self.r if radius_m is None else radius_m
+        return r * (math.cos(azimuth_rad) * self.u + math.sin(azimuth_rad) * self.v) + np.array([0.0, 0.0, h])
+
+    def point(self, i: int) -> np.ndarray:
+        return self.ring_point(self.az[i], self.hs[i], self.rs[i])
+
+    def _where(self, t: float) -> Tuple[int, float]:
+        """(point index, transit fraction to the next one: 0 while dwelling / before)."""
+        c = self.cfg
+        tau = t - self.observe_t0
+        if tau < 0.0 or self.loop_s <= 0.0:
+            return 0, 0.0
+        loop = int(tau // self.loop_s)
+        if c.loops > 0 and loop >= c.loops:
+            return 0, 0.0
+        tau -= loop * self.loop_s
+        for i in range(len(self.az)):
+            if tau < c.dwell_s:
+                return i, 0.0
+            tau -= c.dwell_s
+            if tau < self.transit_s[i]:
+                return i, smoothstep(tau / self.transit_s[i])
+            tau -= self.transit_s[i]
+        return 0, 0.0
+
+    def aim_weight(self, t: float) -> float:
+        i, f = self._where(t)
+        j = (i + 1) % len(self.az)
+        return self.ws[i] + (self.ws[j] - self.ws[i]) * f
 
     def inspection_points(self) -> List[np.ndarray]:
-        return [self.ring_point(a) for a in self.az]
+        return [self.point(i) for i in range(len(self.az))]
 
     def approach_start(self) -> np.ndarray:
-        p0 = self.ring_point(self.az[0])
+        p0 = self.point(0)
         return p0 + self.cfg.approach_distance_m * p0 / np.linalg.norm(p0)
 
     def sample(self, t: float) -> Tuple[str, np.ndarray, int]:
@@ -266,25 +361,87 @@ class ObservationPath:
             return "idle", self.approach_start(), 0
         if t < self.observe_t0 and self.approach_s > 0.0:
             s = smoothstep((t - c.start_delay_s) / self.approach_s)
-            p0 = self.ring_point(self.az[0])
-            return "approach", (1.0 - s) * self.approach_start() + s * p0, 0
+            return "approach", (1.0 - s) * self.approach_start() + s * self.point(0), 0
         tau = t - self.observe_t0
         n = len(self.az)
         if self.loop_s <= 0.0:
-            return ("complete" if c.loops > 0 else "observe"), self.ring_point(self.az[0]), 0
+            return ("complete" if c.loops > 0 else "observe"), self.point(0), 0
         loop = int(tau // self.loop_s)
         if c.loops > 0 and loop >= c.loops:
-            return "complete", self.ring_point(self.az[0]), 0
+            return "complete", self.point(0), 0
         tau -= loop * self.loop_s
         for i in range(n):
             if tau < c.dwell_s:
-                return "observe", self.ring_point(self.az[i]), i
+                return "observe", self.point(i), i
             tau -= c.dwell_s
             if tau < self.transit_s[i]:
-                a = self.az[i] + self.steps[i] * smoothstep(tau / self.transit_s[i])
-                return "observe", self.ring_point(a), i
+                f = smoothstep(tau / self.transit_s[i])
+                j = (i + 1) % n
+                h = self.hs[i] + (self.hs[j] - self.hs[i]) * f
+                r = self.rs[i] + (self.rs[j] - self.rs[i]) * f
+                return "observe", self.ring_point(self.az[i] + self.steps[i] * f, h, r), i
             tau -= self.transit_s[i]
-        return "observe", self.ring_point(self.az[0]), 0
+        return "observe", self.point(0), 0
+
+    def dwell_at(self, t: float) -> Optional[Tuple[int, int, float]]:
+        """(loop, inspection point index, time into the dwell [s]) while holding at an
+        inspection point, else None."""
+        c = self.cfg
+        tau = t - self.observe_t0
+        if tau < 0.0 or self.loop_s <= 0.0:
+            return None
+        loop = int(tau // self.loop_s)
+        if c.loops > 0 and loop >= c.loops:
+            return None
+        tau -= loop * self.loop_s
+        for i in range(len(self.az)):
+            if tau < c.dwell_s:
+                return loop, i, tau
+            tau -= c.dwell_s
+            if tau < self.transit_s[i]:
+                return None  # flying to the next point
+            tau -= self.transit_s[i]
+        return None
+
+
+def depth_sample_slot(path: "ObservationPath", t: float, samples_per_dwell: int, phase: str,
+                      scan_period_s: float = 0.0):
+    """Key of the depth sample due at `t`, or None: `samples_per_dwell` samples evenly
+    inside each dwell (never at its very start or end), one every `scan_period_s` while
+    flying between inspection points (0: off; not on the approach: the scan starts once
+    the Astrobee is close), so the map fills in as it scans,
+    and one per `dwell_s` once the observation is complete. The caller takes each key once."""
+    n = int(samples_per_dwell)
+    if phase == "complete":
+        period = path.cfg.dwell_s if path.cfg.dwell_s > 0.0 else 5.0
+        return ("complete", int(t // period))
+    d = path.dwell_at(t) if phase == "observe" else None
+    if d is None and phase == "observe" and scan_period_s > 0.0:
+        return ("scan", int(t // scan_period_s))
+    if d is None or path.cfg.dwell_s <= 0.0:
+        return None
+    loop, i, tau = d
+    slot = int(tau / path.cfg.dwell_s * (n + 1))
+    return (loop, i, slot) if 1 <= slot <= n else None
+
+
+def dock_view_offset(path_u, path_v, center_w, exit_w, open_dir_w, distance_m: float,
+                     off_axis_deg: float, roll_deg: float) -> Tuple[float, float, float]:
+    """Docking-port close-up viewpoint as (azimuth [rad] in the path's (u, v) basis,
+    height [m], horizontal radius [m]) about the satellite centre: `distance_m` from the
+    nozzle exit, `off_axis_deg` from its outward axis `open_dir_w`, turned `roll_deg`
+    about it (0: horizontal, to the left of the outward axis seen from above; 90: above)."""
+    d = np.asarray(open_dir_w, dtype=float)
+    d = d / np.linalg.norm(d)
+    e1 = np.cross([0.0, 0.0, 1.0], d)
+    if np.linalg.norm(e1) < 1e-6:  # vertical axis: any horizontal reference
+        e1 = np.array([1.0, 0.0, 0.0])
+    e1 = e1 / np.linalg.norm(e1)
+    e2 = np.cross(d, e1)
+    a, b = math.radians(off_axis_deg), math.radians(roll_deg)
+    view = math.cos(a) * d + math.sin(a) * (math.cos(b) * e1 + math.sin(b) * e2)
+    p = np.asarray(exit_w, dtype=float) + distance_m * view - np.asarray(center_w, dtype=float)
+    return math.atan2(float(p @ path_v), float(p @ path_u)), float(p[2]), float(math.hypot(p @ path_u, p @ path_v))
 
 
 def ring_radius_from_aabb(aabb_min, aabb_max, margin_m: float) -> float:
@@ -332,6 +489,28 @@ def follow_mrv_pose(pos0, aim0, mrv0, mrv, dock, elapsed_s: float, blend_s: floa
     return pos, (1.0 - s) * np.asarray(aim0, dtype=float) + s * target
 
 
+def clearance_record(t: float, clearance: DockingClearance, frames: int, voxels: int,
+                     zone: Optional[DockingCorridor] = None) -> dict:
+    """JSON body of `/<ns>/<map.clearance_topic>` (std_msgs/String); `zone`: the keep-out
+    zone (satellite frame, same as the map points) for the web view."""
+    rec = {
+        "t": round(float(t), 3), "is_clear": bool(clearance.is_clear), "observed": bool(clearance.observed),
+        "status": "DOCKING_AVAILABLE" if clearance.is_clear else "DOCKING_UNAVAILABLE",
+        "obstruction_voxels": int(clearance.obstruction_voxels),
+        "nearest_m": float(clearance.nearest_m) if math.isfinite(clearance.nearest_m) else None,
+        "corridor_views": int(clearance.corridor_views), "depth_frames": int(frames), "voxels": int(voxels),
+    }
+    if zone is not None:
+        rec["zone"] = {
+            "exit": [round(float(x), 4) for x in zone.exit_centre],
+            "axis": [round(float(x), 5) for x in zone.direction],  # into the nozzle
+            "front_m": round(float(zone.approach_length), 3), "front_radius_m": round(float(zone.approach_radius), 3),
+            "inner": [[round(float(d), 3), round(float(zone.free_radius(d)), 3)]
+                      for d in np.linspace(zone.start_depth, zone.end_depth, 6)],
+        }
+    return rec
+
+
 def camera_world_pose(body: Frame, cfg: AstrobeeCfg) -> Frame:
     """Camera frame in W (Isaac Lab "world" convention: +X forward, +Z up)."""
     mount = Frame.from_pos_quat(np.asarray(cfg.camera.mount_pos_body_m, dtype=float) * cfg.scale, CAM_IN_BODY_QUAT)
@@ -344,8 +523,9 @@ def camera_world_pose(body: Frame, cfg: AstrobeeCfg) -> Frame:
 
 
 class AstrobeeCameraPublisher:
-    """ROS 2 publisher of the Astrobee camera image. Nothing else is published; the only
-    subscription is the existing MRV mission state topic (docking-complete signal)."""
+    """ROS 2 publishers of the Astrobee: camera image, and (low rate) the map clearance
+    and the accumulated map snapshot. The only subscription is the existing MRV mission
+    state topic (docking-complete signal)."""
 
     def __init__(self, cfg: AstrobeeCfg, distro: str, mission_state_topic: Optional[str] = None):
         from .ros_interface import _import_rclpy
@@ -353,10 +533,11 @@ class AstrobeeCameraPublisher:
         rclpy = self.rclpy = _import_rclpy(distro)
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import Image, PointCloud2, PointField
         from std_msgs.msg import String
 
         self._image = Image
+        self._cloud, self._field, self._string = PointCloud2, PointField, String
         self._owns_context = not rclpy.ok()
         if self._owns_context:
             rclpy.init()
@@ -370,6 +551,17 @@ class AstrobeeCameraPublisher:
         self.frame_id = f"{cfg.ros_namespace}/{cfg.camera.name}"
         self.topic = f"/{cfg.ros_namespace}/{cfg.image_topic}"
         print(f"[ASTROBEE] ROS 2 camera feed on {self.topic} (sensor_msgs/Image rgb8)", flush=True)
+        # Map outputs: latched, so a late subscriber (the web dashboard) gets the latest
+        # clearance / snapshot at once. Published per depth frame / every
+        # `map.points_publish_period_s`, never per camera frame.
+        self.map_pub = self.clearance_pub = None
+        if cfg.map.enabled:
+            latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.clearance_pub = self.node.create_publisher(String, cfg.map.clearance_topic, latched)
+            self.map_pub = self.node.create_publisher(PointCloud2, cfg.map.points_topic, latched)
+            self.map_frame_id = f"{cfg.ros_namespace}/satellite"
+            print(f"[ASTROBEE] map: /{cfg.ros_namespace}/{cfg.map.clearance_topic} (std_msgs/String JSON), "
+                  f"/{cfg.ros_namespace}/{cfg.map.points_topic} (sensor_msgs/PointCloud2, frame {self.map_frame_id})", flush=True)
         self.mission_state: Optional[str] = None
         if mission_state_topic:
             # Same QoS as the publisher (`ros_interface.py` `state`: latched)
@@ -397,6 +589,33 @@ class AstrobeeCameraPublisher:
         m.data = img.tobytes()
         self.pub.publish(m)
 
+    def publish_clearance(self, t: float, clearance: DockingClearance, frames: int, voxels: int,
+                          zone: Optional[DockingCorridor] = None):
+        if self.clearance_pub is None:
+            return
+        m = self._string()
+        m.data = json.dumps(clearance_record(t, clearance, frames, voxels, zone))
+        self.clearance_pub.publish(m)
+
+    def publish_map(self, t: float, points: np.ndarray, obstruction: np.ndarray):
+        """Map snapshot (satellite frame): x, y, z float32 + `obstruction` float32 (1 / 0)."""
+        if self.map_pub is None:
+            return
+        from builtin_interfaces.msg import Time
+
+        f = self._field
+        m = self._cloud()
+        sec = int(math.floor(t))
+        m.header.stamp = Time(sec=sec, nanosec=int((t - sec) * 1e9))
+        m.header.frame_id = self.map_frame_id
+        m.fields = [f(name=n, offset=4 * i, datatype=f.FLOAT32, count=1) for i, n in enumerate(("x", "y", "z", "obstruction"))]
+        data = np.column_stack((np.asarray(points, dtype=np.float32).reshape(-1, 3),
+                                np.asarray(obstruction, dtype=np.float32).reshape(-1, 1))).astype("<f4")
+        m.height, m.width = 1, int(len(data))
+        m.is_bigendian, m.point_step, m.row_step, m.is_dense = False, 16, 16 * int(len(data)), True
+        m.data = data.tobytes()
+        self.map_pub.publish(m)
+
     def close(self):
         try:
             self._executor.remove_node(self.node)
@@ -408,10 +627,12 @@ class AstrobeeCameraPublisher:
 
 
 class AstrobeeObserver:
-    """Flies the Astrobee model + camera along `ObservationPath` and streams the image.
+    """Flies the Astrobee model + camera along `ObservationPath`, streams the image and
+    maps the satellite from depth samples.
 
     `step(t)` before each physics step (poses for the next render), `after_render(t)`
-    after `scene.update` (image grab / publish at `camera.publish_rate_hz`).
+    after `scene.update` (image grab / publish at `camera.publish_rate_hz`, depth sample
+    when one is due). `docking_clearance()` is the corridor check for the mission.
     """
 
     def __init__(self, task, cfg: AstrobeeCfg, ros_enabled: bool, ros_distro: str, headless: bool,
@@ -419,7 +640,7 @@ class AstrobeeObserver:
         import torch
         from pxr import Usd, UsdGeom
 
-        from .docking import prim_frame
+        from .docking import mesh_points_and_triangles, prim_frame
 
         self._torch = torch
         self.cfg = cfg
@@ -446,7 +667,59 @@ class AstrobeeObserver:
         self.sat_dock = geo.sat_dock  # satellite root frame (docking.py SAT_DOCK_POINT)
         center_w = self.center_w()
         dock_w = (self.sat_frame() @ geo.sat_dock).pos
-        self.path = ObservationPath(cfg, radius, dock_w - center_w)
+        dock_view = None
+        if cfg.dock_view_point:
+            ex = self.sat_frame() @ geo.sat_exit
+            u = np.asarray(dock_w - center_w, dtype=float)
+            u[2] = 0.0
+            u = u / max(np.linalg.norm(u), 1e-9)
+            dock_view = dock_view_offset(u, np.cross([0.0, 0.0, 1.0], u), center_w, ex.pos, -ex.rot[:, 2],
+                                         cfg.dock_view_distance_m, cfg.dock_view_off_axis_deg, cfg.dock_view_roll_deg)
+        self.path = ObservationPath(cfg, radius, dock_w - center_w, dock_view)
+        ## Satellite map (`astrobee_map.py`), satellite root frame. Crop box: the
+        ## satellite's AABB corners in that frame; nozzle corridor from the docking geometry
+        self.map: Optional[SatelliteMap] = None
+        self.corridor: Optional[DockingCorridor] = None
+        self.clearance = DockingClearance(is_clear=False, obstruction_voxels=0, nearest_m=math.inf, observed=False)
+        self.corridor_views = 0
+        self._map_dirty = False
+        self._next_map_pub_t = 0.0
+        self._t_render = 0.0
+        self._depth_due: Optional[Frame] = None  # camera pose of the depth frame to map
+        self._depth_slots = set()
+        self._probe = None
+        mc = cfg.map
+        if mc.enabled:
+            corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+            cs = transform(sat_usd.inv(), corners)
+            self._crop = (cs.min(axis=0), cs.max(axis=0))
+            self.map = SatelliteMap(mc.voxel_size_m, mc.max_score, mc.min_hits)
+            keepout_r = geo.nozzle.exit_radius + mc.keepout_radius_extra_m
+            # Docking keep-out zone (satellite frame): nozzle interior + a cylinder in front of the exit
+            self.corridor = DockingCorridor.from_nozzle(
+                geo.nozzle, geo.dock_depth + geo.backstop_gap - mc.corridor_end_margin_m, mc.corridor_start_m, mc.corridor_margin_m,
+                mc.keepout_length_m, keepout_r)
+            # Known 3D models, sampled from the USD meshes: the satellite (around the zone;
+            # what the scan should see there) and the servicer's MEP incl. its probe (never
+            # mapped, it moves). Visual-only non-mesh prims (e.g. floating debris) are not in them.
+            centre, radius = self.corridor.bounding_sphere()
+            sat_parts = mesh_points_and_triangles(stage, geo.sat_prim_path, prim_frame(stage, geo.sat_body_path))
+            self.sat_model = ModelMask(np.vstack([np.zeros((0, 3))] + [
+                sample_triangles(pts, tris, mc.model_sample_spacing_m, centre, radius + 1.0) for _, pts, tris in sat_parts]),
+                mc.voxel_size_m, mc.model_dilate_voxels)
+            mep_parts = mesh_points_and_triangles(stage, geo.mep_path, prim_frame(stage, geo.mep_path))
+            self.mep_model = ModelMask(np.vstack([np.zeros((0, 3))] + [
+                sample_triangles(pts, tris, mc.model_sample_spacing_m) for _, pts, tris in mep_parts]),
+                mc.voxel_size_m, mc.model_dilate_voxels)
+            self._mep = task._obj
+            pr = geo.probe
+            self._probe = (pr.tip, pr.tip - pr.length * pr.direction, pr.body_radius + mc.probe_filter_margin_m)
+            print(f"[ASTROBEE] map: {mc.voxel_size_m*100:.0f} cm voxels, {mc.samples_per_dwell} depth samples per dwell + 1 per "
+                  f"{mc.scan_period_s:g} s in flight, grid {mc.grid_stride_px} px (+ every {mc.roi_stride_px} px around the docking port); "
+                  f"keep-out zone: nozzle {self.corridor.start_depth:.2f}..{self.corridor.end_depth:.2f} m deep + "
+                  f"{self.corridor.approach_length:.2f} m in front of the exit, radius {keepout_r:.2f} m; models: satellite "
+                  f"{len(self.sat_model)} / MEP {len(self.mep_model)} voxels"
+                  f"{' (gates the docking)' if mc.gate_docking else ' (log only)'}", flush=True)
         self.ros: Optional[AstrobeeCameraPublisher] = None
         if ros_enabled:
             self.ros = AstrobeeCameraPublisher(cfg, ros_distro, mission_state_topic if cfg.follow_mrv_after_dock else None)
@@ -473,7 +746,7 @@ class AstrobeeObserver:
                 old.unlink()
         print(f"[ASTROBEE] observation ring: radius {radius:.1f} m, {self.path.h:.1f} m above the satellite centre "
               f"{np.round(center_w, 2).tolist()} (satellite AABB {np.round(hi - lo, 1).tolist()} m), "
-              f"{len(cfg.inspection_azimuths_deg)} inspection points, approach {self.path.approach_s:.0f} s, "
+              f"{len(self.path.az)} inspection points ({', '.join(self.path.labels)}), approach {self.path.approach_s:.0f} s, "
               f"one loop {self.path.loop_s:.0f} s, camera {cfg.camera.width}x{cfg.camera.height} "
               f"FOV {cfg.camera.horizontal_fov_deg:g} deg", flush=True)
 
@@ -537,7 +810,7 @@ class AstrobeeObserver:
         else:
             phase, offset, idx = self.path.sample(t)
             pos = center + offset
-            aim = center + self.cfg.look_at_dock_weight * (dock - center)
+            aim = center + self.path.aim_weight(t) * (dock - center)
         self._aim = np.asarray(aim, dtype=float)
         body = Frame(pos, look_at_rotation(pos, aim))
         if self._last is not None and t > self._last[0]:
@@ -553,14 +826,20 @@ class AstrobeeObserver:
             self._set_state(_PHASE_STATE[phase])
         if phase == "observe" and idx != self._point:
             self._point = idx
-            print(f"[ASTROBEE] inspection point {idx + 1}/{len(self.path.az)} "
-                  f"(azimuth {self.cfg.inspection_azimuths_deg[idx]:g} deg)", flush=True)
+            print(f"[ASTROBEE] inspection point {idx + 1}/{len(self.path.az)} ({self.path.labels[idx]})", flush=True)
         dev = self._xform_device
         self.xform.set_world_poses(
             positions=torch.tensor([pos.tolist()], dtype=torch.float32, device=dev),
             orientations=torch.tensor([list(body.quat)], dtype=torch.float32, device=dev),
         )
         cam = camera_world_pose(body, self.cfg)
+        if self.map is not None and phase != "follow":
+            slot = depth_sample_slot(self.path, t, self.cfg.map.samples_per_dwell, phase, self.cfg.map.scan_period_s)
+            if slot is not None and slot not in self._depth_slots:
+                self._depth_slots.add(slot)
+                self._depth_due = cam
+            elif self._depth_due is not None:
+                self._depth_due = cam  # the pose of the frame that will be rendered
         cdev = self.camera.device
         self.camera.set_world_poses(
             positions=torch.tensor([cam.pos.tolist()], dtype=torch.float32, device=cdev),
@@ -569,7 +848,21 @@ class AstrobeeObserver:
         )
 
     def after_render(self, t: float):
-        """Grab the rendered image and publish it (rate limited)."""
+        """Grab the rendered image and publish it (rate limited); map a due depth sample
+        and publish the map snapshot (at most every `map.points_publish_period_s`)."""
+        self._t_render = t
+        if self._depth_due is not None:
+            cam_w = self._depth_due
+            self._depth_due = None
+            try:
+                # satellite pose after the physics step, i.e. the one in the rendered image
+                self.map_depth_frame(cam_w, self.sat_frame())
+            except Exception as e:  # the map must never stop the run
+                print(f"[ASTROBEE] depth frame not mapped: {e}", flush=True)
+        if self._map_dirty and self.ros is not None and t >= self._next_map_pub_t:
+            self._map_dirty = False
+            self._next_map_pub_t = t + self.cfg.map.points_publish_period_s - 1e-9
+            self.ros.publish_map(t, *self.map_snapshot())
         c = self.cfg.camera
         publish_due = self.ros is not None and t >= self._next_pub_t
         save_due = self.save_dir is not None and t >= self._next_save_t
@@ -586,6 +879,78 @@ class AstrobeeObserver:
             self._next_save_t = t + c.save_every_s - 1e-9
             cv2.imwrite(str(self.save_dir / f"astrobee_{t:08.2f}s.png"), cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR))
             self.saved += 1
+
+    def mep_world(self) -> Frame:
+        return Frame.from_pos_quat(self._mep.data.root_pos_w[0].tolist(), self._mep.data.root_quat_w[0].tolist())
+
+    def probe_capsule_w(self):
+        mep = self.mep_world()
+        a, b, r = self._probe
+        return mep.point(a), mep.point(b), r
+
+    def map_depth_frame(self, cam_w: Frame, sat_w: Frame):
+        """Back-project the depth image rendered from `cam_w` into the map (satellite
+        frame at the render `sat_w`), carve what it sees through, re-check the corridor."""
+        mc = self.cfg.map
+        depth = self.camera.data.output["distance_to_image_plane"][0].cpu().numpy().astype(float)
+        depth = depth.reshape(depth.shape[0], depth.shape[1])
+        k = self.camera.data.intrinsic_matrices[0].cpu().numpy().astype(float)
+        pts, cam_s, near = depth_frame_points(depth, k, cam_w, sat_w, mc, self.corridor, self._crop,
+                                              [self.probe_capsule_w()], frame_index=self.map.frames,
+                                              exclude_models=[(self.mep_world(), self.mep_model)])
+        if near >= mc.min_view_points:
+            self.corridor_views += 1
+        carved = self.map.carve(cam_s, depth, k, mc.carve_tolerance_m, mc.max_range_m)
+        added = self.map.integrate(pts)
+        before = self.clearance
+        self.clearance = evaluate_clearance(self.map, self.corridor, mc.min_obstruction_voxels,
+                                            self.corridor_views, mc.min_corridor_views, self.sat_model)
+        print(f"[ASTROBEE] depth frame {self.map.frames}: {len(pts)} points ({near} at the nozzle; {self._nozzle_view(cam_s, depth, k)}), "
+              f"+{added} / -{carved} voxels, map {len(self.map)} voxels ({len(self.map.confirmed())} confirmed)", flush=True)
+        self._map_dirty = True
+        if self.ros is not None:
+            self.ros.publish_clearance(self._t_render, self.clearance, self.map.frames, len(self.map), self.corridor)
+        if (before.is_clear, before.observed, before.obstruction_voxels) != (
+                self.clearance.is_clear, self.clearance.observed, self.clearance.obstruction_voxels):
+            verdict = "CLEAR" if self.clearance.is_clear else "OBSTRUCTED" if self.clearance.observed else "NOT OBSERVED"
+            print(f"[ASTROBEE] docking clearance: {verdict} -- "
+                  f"{self.clearance.summary()}", flush=True)
+
+    def _nozzle_view(self, cam_s: Frame, depth: np.ndarray, k: np.ndarray) -> str:
+        """Log detail: is the corridor in the image, and is it occluded (median depth in
+        its pixel window well short of its distance)?"""
+        centre, radius = self.corridor.bounding_sphere()
+        c = transform(cam_s.inv(), centre[None, :])[0]
+        roi = sphere_roi(c, radius, k, depth.shape[1], depth.shape[0])
+        if roi is None:
+            return f"nozzle out of view at {c[0]:.1f} m"
+        u0, u1, v0, v1 = roi
+        win = depth[v0:v1, u0:u1]
+        win = win[np.isfinite(win)]
+        med = f"{float(np.median(win)):.1f} m" if len(win) else "no return"
+        return f"nozzle window {u1 - u0}x{v1 - v0} px at {c[0]:.1f} m, median depth {med}"
+
+    def docking_clearance(self) -> DockingClearance:
+        """Latest corridor check (not clear until the corridor has been observed)."""
+        return self.clearance
+
+    def map_snapshot(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Voxel centres (satellite frame) and their obstruction flag (what `clearance`
+        counts: confirmed, inside the keep-out zone, not explained by the satellite model)."""
+        pts = self.map.centers()
+        obstruction = self.map.score >= self.map.min_hits
+        obstruction[obstruction] = self.corridor.contains(pts[obstruction])
+        obstruction[obstruction] = ~self.sat_model.explains(pts[obstruction])
+        return pts, obstruction
+
+    def save_map(self, path: Path) -> Optional[Path]:
+        """Map snapshot as PLY; obstruction voxels in red."""
+        if self.map is None or not len(self.map):
+            return None
+        pts, obstruction = self.map_snapshot()
+        cols = np.tile(np.array([200, 200, 210], dtype=np.uint8), (len(pts), 1))
+        cols[obstruction] = (255, 40, 40)
+        return write_ply(path, pts, cols)
 
     def open_window(self):
         """GUI: live viewport window of the Astrobee camera."""
@@ -610,6 +975,11 @@ class AstrobeeObserver:
     def close(self):
         print(f"[ASTROBEE] {self.frames} camera frames published"
               f"{f', {self.saved} saved to {self.save_dir}' if self.save_dir is not None else ''}", flush=True)
+        if self.map is not None:
+            print(f"[ASTROBEE] map: {self.map.frames} depth frames, {len(self.map)} voxels; final docking clearance: "
+                  f"{self.clearance.summary()}", flush=True)
+            if self._map_dirty and self.ros is not None:
+                self.ros.publish_map(self._t_render, *self.map_snapshot())  # the final snapshot (latched)
         if self.ros is not None:
             self.ros.close()
             self.ros = None

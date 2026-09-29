@@ -9,7 +9,7 @@
 | MRV + Canadarm3 | MEP 포획·이송·분리 | 7-DoF; 시작 오프셋 [-5,0,-3] m; 이동 0.4 m/s, 가속 0.15 m/s²; 팔 전개 10 s (`yaml:232-289`) |
 | MEP | 수명연장 모듈 | 3,000 kg; 0.01 m/s; six_dof일 때 0.50°/s; AprilTag 4개 60 mm (`yaml:10-26,66-81`) |
 | Client Satellite | MEP 도킹 목표 | Ares1 probe를 추력기 노즐 내부 도킹점에 결합; 기본 정지, 이동 시 병진 표류만 검증 범위 (`yaml:307-322`) |
-| Astrobee | 관찰 전용 자유비행 카메라 | collider 없음; 4방위 관측·각 5 s; 640×480/5 Hz (`yaml:562-612`) |
+| Astrobee | 관찰 카메라 + 위성 외형 맵·도킹 통로 판정 | collider 없음; 4방위 관측·각 5 s; 640×480/5 Hz; dwell당 depth 2회 → 5 cm 보셀 맵, 노즐 통로 이물질 시 `DOCKING_UNAVAILABLE` (`astrobee.map`) |
 
 ## 2. 전체 파이프라인
 
@@ -29,7 +29,7 @@ flowchart LR
 | 2 | `SEARCH`, predicted-pose approach | tag constellation 발견 → 최종 standoff | vision 10 Hz, 예측 0.3 s, far/near/capture 0.10/0.04/0.01 m/s; approach timeout 60 s |
 | 3 | capture `FixedJoint`, `HOLDING` | 거리·각도·속도·횡오차 모두 만족 → 2 s 유지 | ≤150 mm, ≤5°, ≤0.05 m/s, ≤20 mm; holding drift ≤5 mm/0.5° |
 | 4 | `DOCK_TARGET_ACQUIRE`, `PRE_DOCK_APPROACH`, alignment | MEP를 1 m pre-dock pose로 이송 → 정렬 통과 | transport/approach 0.15 m/s, align 0.015 m/s·2°/s |
-| 5 | `Z_APPROACH`, `FINAL_INSERTION`, `DOCK_READY` | 모든 도킹 조건 → MEP–Client `FixedJoint` | 축/반경 40/40 mm, 축각/roll 2°/4°, 상대속도 ≤0.05 m/s, depth agreement 150 mm |
+| 5 | `Z_APPROACH`, `FINAL_INSERTION`, `DOCK_READY` (막히면 `DOCKING_UNAVAILABLE`로 종료) | Astrobee 맵의 노즐 통로가 비어 있음 + 모든 도킹 조건 → MEP–Client `FixedJoint` | 축/반경 40/40 mm, 축각/roll 2°/4°, 상대속도 ≤0.05 m/s, depth agreement 150 mm |
 | 6 | `STABILIZING`, robot release, arm retreat, MRV separation | stack 안정 → MEP release → MRV 이탈 | 2 s 안정화, arm 0.6 m 후퇴, MRV 0.4 m/s×15 s, 최소 거리 증가 0.1 m |
 | 7 | — | — | **미구현** |
 

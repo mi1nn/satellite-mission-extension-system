@@ -29,6 +29,8 @@ flowchart LR
 | IR-08 | BR-05 | out | `/mrv/state`, `/mrv/captured`, `/mrv/status` | String/Bool/String JSON | 상태(latched), FixedJoint 여부, metrics/tags/standoff | 10 Hz |
 | IR-09 | BR-03 | out | `/tf` | `tf2_msgs/TFMessage` | `world → cylinder_est/cylinder_pred/ee/cam_wrist/cylinder_gt` | 10 Hz |
 | IR-10 | BR-04 | out | `/astrobee/camera/image_raw` | `sensor_msgs/Image` | 640×480 RGB8 관찰 영상 | 5 Hz |
+| IR-10a | BR-04 | out | `/astrobee/map/clearance` | `std_msgs/String` JSON (latched) | `is_clear`, `observed`, `status`(DOCKING_AVAILABLE/UNAVAILABLE), `obstruction_voxels`, `nearest_m` | depth 샘플마다 |
+| IR-10b | BR-04 | out | `/astrobee/map/points` | `sensor_msgs/PointCloud2` (latched) | 위성 프레임 보셀 중심 x,y,z + `obstruction`(1/0), frame `astrobee/satellite` | ≥5 s 간격 |
 | IR-11 | BR-05 | in | `/mrv/cmd/start`, `pause`, `resume`, `abort`, `reset` | `std_msgs/Empty` | 시작·일시정지·재개·안전 중단·초기화 | event |
 | IR-12 | BR-03 | in | `/mrv/cmd/capture_enable` | `std_msgs/Bool` | false면 추적만 하고 결합 금지 | event |
 

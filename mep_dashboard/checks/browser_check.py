@@ -24,6 +24,13 @@ with sync_playwright() as p:
     assert page.locator("#play").count() == 1
     assert page.locator("#pause").count() == 1
     assert page.locator("#stop").count() == 1
+    # CAMERA 4 (Astrobee map) next to CAMERA 3; OFFLINE placeholder until map data arrives
+    cameras = page.locator(".camera-row-4 article.camera h2").all_inner_texts()
+    assert cameras[2:] == ["CAMERA 3 · ASTROBEE", "CAMERA 4 · ASTROBEE MAP"], cameras
+    map_panel = page.locator("article.panel", has_text="CAMERA 4")
+    if map_panel.locator("canvas:visible").count() == 0:
+        assert map_panel.locator(".offline").inner_text().strip() == "● WAITING"
+        assert map_panel.locator(".stream-label").is_visible()
 
     page.locator("#validation-tab").click()
     page.wait_for_function(
