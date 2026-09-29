@@ -1,5 +1,32 @@
 # Automated Satellite Mission Extension System
 
+<p align="center">
+  <img alt="Ubuntu" src="https://img.shields.io/badge/Ubuntu-24.04-E95420?logo=ubuntu&amp;logoColor=white">
+  <img alt="ROS 2" src="https://img.shields.io/badge/ROS_2-Jazzy-22314E?logo=ros&amp;logoColor=white">
+  <img alt="Python 3.10" src="https://img.shields.io/badge/Python-3.10-F7DF1E?logo=python&amp;logoColor=white">
+  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&amp;logoColor=white">
+  <img alt="Isaac Sim 5.0.0" src="https://img.shields.io/badge/Isaac_Sim-5.0.0-76B900?logo=nvidia&amp;logoColor=white">
+
+  <a href="https://andrejorsula.github.io/space_robotics_bench/getting_started/install.html">
+    <img alt="Space Robotics Bench" src="https://img.shields.io/badge/Built_with-Space_Robotics_Bench-3B82F6?logo=isaacsim&amp;logoColor=white">
+  </a>
+  <a href="https://www.nasa.gov/astrobee/">
+    <img alt="NASA Astrobee" src="https://img.shields.io/badge/Reference-NASA_Astrobee-0B3D91?logo=nasa&amp;logoColor=white">
+  </a>
+  <a href="https://science.nasa.gov/3d-resources/">
+    <img alt="NASA 3D Resources" src="https://img.shields.io/badge/Assets-NASA_3D_Resources-0B3D91?logo=nasa&amp;logoColor=white">
+  </a>
+
+  <img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-D22128">
+</p>
+
+<p align="center">
+  <img src ="./docs/image/image.png" width="300"> <img src ="./docs/image/image (1).png" width="300">    
+  <img src ="./docs/image/web_ui.png" width="300"> <img src ="./docs/image/point_cloud.png" width="300"> 
+</p>
+
+## 0. 시스템 개요
+
 Isaac Sim 기반 궤도상 위성 수명연장 임무 시뮬레이션과 실시간 모니터링 대시보드.
 
 MRV(Mission Robotic Vehicle)가 표류하는 MEP(Mission Extension Pod)를 로봇팔로 포착하고,
@@ -19,6 +46,8 @@ MRV(Mission Robotic Vehicle)가 표류하는 MEP(Mission Extension Pod)를 로�
 
 두 PC를 나눠 쓰지 않고 한 대에서 전부 실행해도 됩니다.
 
+<img src ="./docs/image/system_flow.png">
+
 ---
 
 ## 1. 요구 사항
@@ -35,6 +64,9 @@ pip 으로 설치되지 않는 것부터 준비합니다.
 
 시뮬레이터 PC와 모니터링 PC의 `ROS_DOMAIN_ID` 가 같아야 합니다.
 
+
+
+
 ## 2. 설치
 
 ```bash
@@ -47,6 +79,16 @@ python3 -m venv --system-site-packages .venv
 
 # 시뮬레이션 측 (srb 패키지를 Isaac Sim 인터프리터에 등록)
 ~/isaac-sim/python.sh -m pip install --editable project
+```
+
+Isaac Sim / Isaac Lab 공식 경로를 통해 설치 가능합니다. 
+
+```
+Isaac-Sim 설치 경로
+https://docs.isaacsim.omniverse.nvidia.com/latest/index.html
+
+Isaac-Lab 설치 경로
+https://isaac-sim.github.io/IsaacLab/v2.2.1/source/setup/installation/binaries_installation.html#installing-isaac-lab
 ```
 
 Isaac Sim / Isaac Lab 자체가 없다면 업스트림 설치 스크립트를 먼저 실행합니다.
@@ -133,7 +175,7 @@ simulation_sessions/{session_id}                         # 실행 요약 (성공
 simulation_sessions/{session_id}/session_telemetry/{id}  # 시계열 (기본 5 Hz, sim_time 기준)
 ```
 
-`session_id` 는 `run_YYYYMMDD_HHMMSS` 형식입니다. 자세한 필드는 `docs/firebase_db.md` 참고.
+`session_id` 는 `run_YYYYMMDD_HHMMSS` 형식입니다. 자세한 필드는 [docs/03_interface_requirements.md](docs/03_interface_requirements.md) 참고.
 
 ### 세션 영상
 
@@ -178,7 +220,7 @@ Firestore 에 접근할 수 없으면 캐시본을 내려주고 화면 상단에
 │   ├── backend/app.py            # FastAPI: Firestore API + ROS 2 라이브 + 영상 서빙
 │   ├── frontend/                 # HTML / CSS / Vanilla JS / Chart.js
 │   └── checks/                   # 브라우저·캐시 검증 스크립트
-└── docs/                         # 설계 노트와 단계별 기록
+└── docs/                         # 요구사항·시나리오·브랜치 이력·레퍼런스 (docs/README.md)
 ```
 
 `project/srb/` 는 [Space Robotics Bench](https://github.com/AndrejOrsula/space_robotics_bench) 포크입니다.

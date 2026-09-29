@@ -5,7 +5,7 @@ Subscribes to the telemetry topics of `vision_capture.py --ros` and stores them 
 so that a web dashboard can read them in real time (`onSnapshot`). It is a separate process:
 the simulator is not touched and never waits for the network.
 
-Firestore layout (the two SQL-style tables of the spec, see docs/firebase_db.md):
+Firestore layout (the two SQL-style tables of the spec, see docs/03_interface_requirements.md):
 
     simulation_sessions/{session_id}                       session summary + final KPIs
     simulation_sessions/{session_id}/session_telemetry/{n} time series rows, ~5 Hz

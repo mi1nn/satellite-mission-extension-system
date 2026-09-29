@@ -17,8 +17,6 @@ window.initValidation = async function () {
   const bool = value => hasBool(value) ? value : null;
   const timeOf = row => finite(row.sim_time) ?? finite(row.sim_time_s);
 
-  // Confirmed tolerance: a measured run is within tolerance at <= 5 mm.
-  const TOLERANCE_M = 0.005;
 
   const STAGES = [
     {
@@ -149,6 +147,11 @@ window.initValidation = async function () {
     };
   };
 
+  // Whole pipeline passed: reached the SUCCESS terminal state with both capture and
+  // docking done. `mission_success` alone is not enough -- it is true for capture-only
+  // runs (no --dock) and for sessions closed by the idle timeout after docking.
+  const fullPipelineSuccess = run =>
+    run.raw.final_state === 'SUCCESS' && run.captureSuccess === true && run.dockingSuccess === true;
   const values = (runs, key) => runs.map(run => run[key]).filter(value => finite(value) !== null);
   const mean = list => list.length ? list.reduce((sum, value) => sum + value, 0) / list.length : null;
   const successRate = list => {
@@ -157,11 +160,15 @@ window.initValidation = async function () {
     return known.length ? { rate: count / known.length, count, total: known.length } : null;
   };
   const percent = result => result ? `${(result.rate * 100).toFixed(1)}%` : 'N/A';
-  const toleranceRate = errors => {
+  // Repeatability: spread (population standard deviation) of the error over repeated runs.
+  const spread = errors => {
     if (!errors.length) return null;
-    const count = errors.filter(value => value <= TOLERANCE_M).length;
-    return { rate: count / errors.length, count, total: errors.length };
+    const avg = mean(errors);
+    const sigma = Math.sqrt(mean(errors.map(value => (value - avg) ** 2)));
+    return { mean: avg, sigma, total: errors.length };
   };
+  const formatSpread = result => result ? `±${(result.sigma * 1000).toFixed(2)} mm` : 'N/A';
+  const spreadNote = result => `${result.total} successful run${result.total === 1 ? '' : 's'}`;
   const formatDuration = seconds => {
     if (finite(seconds) === null) return 'N/A';
     const rounded = Math.max(0, Math.round(seconds));
@@ -668,7 +675,6 @@ window.initValidation = async function () {
       $('overall-rate').textContent = 'N/A';
       $('overall-count').textContent = 'No valid mission_success';
       $('avg-time').textContent = 'N/A';
-      $("avg-minutes").textContent = "전부 완료된 데이터값만으로 계산";
       $('capture-repeatability').textContent = 'N/A';
       $('capture-repeatability-note').textContent = 'No GT capture metric';
       $('docking-accuracy').textContent = 'N/A';
@@ -679,19 +685,18 @@ window.initValidation = async function () {
     }
 
     const overall = successRate(runs.map(run => run.missionSuccess));
-    const duration = values(runs.filter(run => run.missionSuccess === true), 'duration');
+    const duration = values(runs.filter(fullPipelineSuccess), 'duration');
     const averageDuration = mean(duration);
     $('overall-rate').textContent = percent(overall);
     $('overall-count').textContent = overall ? `${overall.count} / ${overall.total} mission_success` : 'N/A — mission_success unavailable';
     $('avg-time').textContent = formatDuration(averageDuration);
-    $("avg-minutes").textContent = "전부 완료된 데이터값만으로 계산";
 
-    const captureTolerance = toleranceRate(values(runs, 'captureError'));
-    const dockingTolerance = toleranceRate(values(runs, 'dockingError'));
-    $('capture-repeatability').textContent = percent(captureTolerance);
-    $('capture-repeatability-note').textContent = captureTolerance ? `${captureTolerance.count} / ${captureTolerance.total} within 5 mm` : 'No GT capture metric';
-    $('docking-accuracy').textContent = percent(dockingTolerance);
-    $('docking-accuracy-note').textContent = dockingTolerance ? `${dockingTolerance.count} / ${dockingTolerance.total} within 5 mm` : 'No docking metric';
+    const captureSpread = spread(values(runs.filter(run => run.captureSuccess === true), 'captureError'));
+    const dockingSpread = spread(values(runs.filter(run => run.dockingSuccess === true), 'dockingError'));
+    $('capture-repeatability').textContent = formatSpread(captureSpread);
+    $('capture-repeatability-note').textContent = captureSpread ? spreadNote(captureSpread) : 'No GT capture metric';
+    $('docking-accuracy').textContent = formatSpread(dockingSpread);
+    $('docking-accuracy-note').textContent = dockingSpread ? spreadNote(dockingSpread) : 'No docking metric';
 
     renderHistory(runs);
     const latest = runs[runs.length - 1];
@@ -710,7 +715,6 @@ window.initValidation = async function () {
     $('overall-count').textContent = 'Firebase Connection Error';
     $('total-runs').textContent = '—';
     $('total-runs-note').textContent = 'Firebase Connection Error';
-    $("avg-minutes").textContent = "전부 완료된 데이터값만으로 계산";
     $('capture-repeatability-note').textContent = 'Firebase Connection Error';
     $('docking-accuracy-note').textContent = 'Firebase Connection Error';
     $('run-history').innerHTML = '<tr><td colspan="5">FIREBASE CONNECTION ERROR</td></tr>';

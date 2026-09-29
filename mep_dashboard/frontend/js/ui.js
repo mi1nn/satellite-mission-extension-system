@@ -140,7 +140,7 @@
 
   // ------------------------------------------------------- card expand buttons
   function initExpandButtons() {
-    const cards = document.querySelectorAll('.panel > .panel-heading, .mission-state > .panel-heading');
+    const cards = document.querySelectorAll('.panel > .panel-heading');
     cards.forEach(heading => {
       const card = heading.closest('.panel');
       if (!card || heading.querySelector('.icon-btn')) return;

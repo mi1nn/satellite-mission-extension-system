@@ -56,7 +56,6 @@ window.initLive = function () {
   const relativeVelocityEl = document.getElementById('relative-velocity');
 
   const signalEl = document.getElementById('live-signal');
-  const rateEl = document.getElementById('live-rate');
 
   let socket = null;
   let reconnectTimer = null;
@@ -151,7 +150,6 @@ window.initLive = function () {
       badge.textContent = '● LIVE MISSION · ROS2 ONLINE';
       playback.textContent = 'ROS2 LIVE';
       signalEl.innerHTML = '<i class="dot"></i> LIVE ROS2 SIGNAL';
-      rateEl.textContent = 'LIVE ROS2 TELEMETRY';
 
       updateMissionControls();
     } else {

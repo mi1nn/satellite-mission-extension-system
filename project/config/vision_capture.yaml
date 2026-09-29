@@ -29,7 +29,7 @@ mep:
   # six_dof: the start orientation is also rotated back by Exp(-[w] t) about
   # Cylinder_01, so the MEP turns through the nominal orientation at the same time;
   # the position then passes the nominal only approximately (PhysX rotates the body
-  # about its centre of mass -- see docs/mrv_six_dof_capture.md).
+  # about its centre of mass -- see docs/04_scenario.md).
   rendezvous_time_s: 15.0
   # six_dof only. converge: the MEP turns into the nominal (parallel) orientation at
   # rendezvous_time_s (start orientation rotated back by Exp(-w t)); diverge: it starts in
@@ -284,11 +284,25 @@ mrv:
   plume_length_m: 2.5
   plume_radius_m: 0.45
   plume_flicker: 0.18
+  # Mid-plume colour, with the near-nozzle core fading through it to the diffuse tail
+  # colour below -- the hot-core -> cooling-tail gradient a real thruster plume shows.
   plume_color: [0.55, 0.78, 1.0]
+  plume_core_color: [0.85, 0.93, 1.0]
+  plume_tail_color: [1.0, 0.55, 0.15]
   # Spread of the 4 plumes over the exhaust face, as a fraction of the thruster box
   # half extent, and how far the nozzle sits inside the hull silhouette
   plume_spread: 0.45
   plume_inset: 0.85
+  # "flow": volumetric fire (Omniverse Flow, RTX), "cones": translucent cone meshes.
+  # "flow" falls back to "cones" if omni.flowusd cannot be loaded.
+  vfx_style: flow
+  # The voxel size trades detail for GPU time
+  fire_speed_mps: 25.0
+  fire_cooling_rate: 1.5
+  # exhaust density fade; keep it above fire_cooling_rate (else the cooled gas shows as a dark trail)
+  fire_fade_rate: 6.0
+  fire_length_m: 5.0
+  fire_cell_size_m: 0.07
 
 docking:
   # Phase 2: the captured MEP's Ares1 probe is docked into the satellite thruster.
