@@ -29,8 +29,8 @@
 
 Isaac Sim 기반 궤도상 위성 수명연장 임무 시뮬레이션과 실시간 모니터링 대시보드.
 
-MRV(Mission Robotic Vehicle)가 표류하는 MEP(Mission Extension Pod)를 로봇팔로 포착하고,
-목표 위성에 도킹시키는 전 과정을 물리 시뮬레이션으로 실행하고 기록·시각화합니다.
+MRV(Mission Robotic Vehicle)가 표류하는 MEP(Mission Extension Pod)를 로봇팔로 포착해
+목표 위성에 도킹합니다. Astrobee는 RGB-D 영상으로 위성 주변 포인트 클라우드를 쌓아 도킹 통로의 장애물을 확인합니다. 통로가 막혔거나 삽입 전까지 관측되지 않으면 도킹을 중단합니다.
 
 ```
 ┌─ GPU PC ─────────────────┐   ROS 2 (DDS)   ┌─ Monitoring PC ───────────────┐
@@ -167,6 +167,44 @@ source /opt/ros/jazzy/setup.bash
 
 실패 상태는 실패한 단계 번호를 유지합니다 (1단계로 되돌아가지 않음).
 
+각 객체의 역할과 실제 구현 파일을 펼쳐 볼 수 있습니다. 아래 항목은 동작 설명이지 객체별 실행 스위치가 아닙니다.
+
+<details>
+<summary>MRV · 포획·운반·분리</summary>
+
+- **역할:** 2구간 접근 후 Canadarm3를 전개해 MEP를 포획·운반하고, 도킹 뒤 팔과 MRV를 분리합니다.
+- **핵심 기능:** 손목 카메라의 AprilTag 추정·0.3초 예측을 DLS IK로 추종하고 포획·이송을 제어합니다. MRV 이동은 추력 동역학이 아닌 운동학적 이동입니다.
+- **코드:** [`mrv_approach.py`](project/srb/tasks/manipulation/debris_capture/mrv_approach.py), [`vision.py`](project/srb/tasks/manipulation/debris_capture/vision.py), [`capture.py`](project/srb/tasks/manipulation/debris_capture/capture.py), [`vision_capture_demo.py`](project/srb/tasks/manipulation/debris_capture/vision_capture_demo.py)
+
+</details>
+
+<details>
+<summary>MEP · 표류하는 수명연장 모듈</summary>
+
+- **역할:** 포획 전에는 자유비행하며, 포획 후 MRV 팔에, 도킹 후 위성에 결합됩니다.
+- **핵심 기능:** 부착면의 AprilTag로 포획 대상이 되고 Ares1 probe로 위성 노즐에 삽입됩니다. 포획·도킹 결합은 실제 흡착이나 래치가 아닌 `FixedJoint` 근사입니다.
+- **코드:** [`task.py`](project/srb/tasks/manipulation/debris_capture/task.py), [`capture.py`](project/srb/tasks/manipulation/debris_capture/capture.py), [`docking.py`](project/srb/tasks/manipulation/debris_capture/docking.py)
+
+</details>
+
+<details>
+<summary>Client Satellite · 도킹 대상</summary>
+
+- **역할:** 추력기 노즐 내부의 도킹점을 제공하며, 이동 시나리오에서는 병진 표류합니다.
+- **핵심 기능:** USD 메시에서 도킹 프레임을 측정하고, probe 정렬·깊이·상대속도 조건을 검사해 MEP와 결합합니다. 위성 도킹 pose는 엔진의 물리 상태에서 읽으며 별도 비전 위치 추정이 아닙니다. 7단계 궤도 이송은 구현되지 않았습니다.
+- **코드:** [`docking.py`](project/srb/tasks/manipulation/debris_capture/docking.py), [`probe_dock.py`](project/srb/tasks/manipulation/debris_capture/probe_dock.py), [`moving_dock.py`](project/srb/tasks/manipulation/debris_capture/moving_dock.py)
+
+</details>
+
+<details>
+<summary>Astrobee · 관측·포인트 클라우드 안전 게이트</summary>
+
+- **역할:** 위성 주위를 비행하며 RGB 관찰 영상을 내고 depth로 위성 프레임의 3D 맵을 만듭니다. 위치·자세는 시뮬레이터 pose를 사용하며 별도로 추정하지 않습니다.
+- **핵심 기능:** depth 역투영 → 3 cm 보셀 누적·free-space carving → 위성/MEP 메시로 설명되는 점 제외 → 노즐 안과 출구 앞 금지 구역의 이물질 판정. 통로 관측 2회 이상 확인 후 확정 장애물은 임무 중 `DOCKING_UNAVAILABLE`로 중단하고, 관측 부족도 삽입 전 게이트에서 도킹 불가로 판정합니다. ROS 2 포인트 맵·판정을 CAMERA 4에 표시합니다.
+- **코드:** [`astrobee.py`](project/srb/tasks/manipulation/debris_capture/astrobee.py), [`astrobee_map.py`](project/srb/tasks/manipulation/debris_capture/astrobee_map.py), [`vision_capture_demo.py`](project/srb/tasks/manipulation/debris_capture/vision_capture_demo.py), [`map3d.js`](mep_dashboard/frontend/js/map3d.js)
+
+</details>
+
 ## 5. 데이터
 
 ### Firestore
@@ -197,12 +235,14 @@ Firestore 에 접근할 수 없으면 캐시본을 내려주고 화면 상단에
 ## 6. 대시보드
 
 **LIVE MISSION** — ROS 2 실시간. Isaac Sim 뷰포트, 임무 상태와 진행률, 속도·각속도·잔여 거리,
-위치 오차 그래프, 카메라 3면(MEP 포착 / 위성 도킹 / Astrobee)과 CAMERA 4 · ASTROBEE MAP(위성 3D 포인트 맵, 이물질 빨강,
-DOCKING AVAILABLE / UNAVAILABLE). PLAY·PAUSE·STOP 으로 시뮬레이터를 제어합니다.
+위치 오차 그래프, 카메라 3면(MEP 포착 / 위성 도킹 / Astrobee 관찰) 및 CAMERA 4 · ASTROBEE MAP을 표시합니다.
+CAMERA 4는 위성 좌표계의 보셀 맵과 노즐 금지 구역 윤곽을 그리고 장애물 점을 빨간색으로 표시합니다.
+판정 전에는 `NOT OBSERVED`, 관측 후에는 `DOCKING AVAILABLE / UNAVAILABLE`을 표시합니다.
+PLAY·PAUSE·STOP으로 시뮬레이터를 제어합니다.
 
 **TECHNOLOGY VALIDATION** — Firestore 기록. 성공률·실행 횟수·평균 임무 시간·포착 반복 정밀도·도킹 정밀도,
-실행 이력 표, 단계별 텔레메트리 그래프(구간 선택 → JSON 내보내기), 선택 구간의 임무 영상,
-실행 종료 시 저장된 Astrobee 맵(`GET /api/validation/runs/{id}/pointcloud`, `.ply`).
+실행 이력 표, 단계별 텔레메트리 그래프(구간 선택 → JSON 내보내기), 선택 구간의 임무 영상.
+실행 종료 시 저장한 Astrobee 맵은 `GET /api/validation/runs/{id}/pointcloud`에서 `.ply`로 내려받을 수 있습니다(해당 실행에 맵이 있을 때).
 
 ## 7. 저장소 구조
 
