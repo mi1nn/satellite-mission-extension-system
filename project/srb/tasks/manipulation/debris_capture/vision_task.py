@@ -140,7 +140,8 @@ class VisionCaptureTaskCfg(DockingTaskCfg):
                     update_period=0.0,
                     width=int(ac.width),
                     height=int(ac.height),
-                    data_types=["rgb"],
+                    # depth only for the satellite map, sampled a few times per dwell
+                    data_types=["rgb", "distance_to_image_plane"] if ab.map.enabled else ["rgb"],
                     spawn=PinholeCameraCfg(
                         focal_length=ac.focal_length_mm,
                         horizontal_aperture=ac.horizontal_aperture_mm,
@@ -288,6 +289,18 @@ class VisionCaptureTask(DockingTask):
                   f"{pc.offset_from_tip_m*1000:.0f} mm in front of the tip, {pc.width}x{pc.height}, "
                   f"FOV {pc.horizontal_fov_deg:g} deg, rgb + distance_to_image_plane", flush=True)
 
+        ## Astrobee map demo: floating debris blocking the docking port (visual only: the
+        ## Astrobee's depth camera sees it, nothing collides with it). The demo moves it
+        ## every step (`FloatingDebris.update`).
+        self.floating_debris: Optional["FloatingDebris"] = None
+        am = v.astrobee.map
+        if v.astrobee.enabled and am.enabled and am.test_obstruction:
+            self.floating_debris = FloatingDebris(stage, geo, am)
+            where = "in front of" if am.test_obstruction_depth_m < 0.0 else "inside"
+            print(f"[INIT] floating debris at the docking port: {am.test_obstruction_size_m:.2f} m plate, "
+                  f"{abs(am.test_obstruction_depth_m):.2f} m {where} the nozzle exit, drifting +-{am.test_obstruction_float_amplitude_m:.2f} m, "
+                  f"tumbling {am.test_obstruction_tumble_deg_s:g} deg/s ({self.floating_debris.path})", flush=True)
+
         _, mep_nominal, _ = geo.placement()
         self.mep_nominal = mep_nominal
         drift = v.mep.linear_velocity_w()
@@ -351,6 +364,59 @@ def spawn_dock_ring(stage, geo, inner_factor: float = 0.75, segments: int = 96) 
     mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
     UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(mat)
     return path
+
+
+class FloatingDebris:
+    """A small tumbling plate floating at the docking port (visual only: no collider, no
+    mass), authored under the satellite body so it rides along with it. Its pose in the
+    satellite body frame is a smooth function of time (`update`), bobbing about
+    `test_obstruction_depth_m` on the nozzle axis (< 0: in front of the exit)."""
+
+    def __init__(self, stage, geo, cfg):
+        from pxr import Gf, Sdf, UsdShade
+
+        self.cfg = cfg
+        self.scale = float(np.mean(geo.sat_scale))
+        ex = geo.sat_exit  # satellite body frame, +Z into the nozzle
+        self.axes = ex.rot
+        self.centre = ex.pos + cfg.test_obstruction_depth_m * ex.rot[:, 2] + cfg.test_obstruction_lateral_m * ex.rot[:, 0]
+        self.path = f"{geo.sat_body_path}/floating_debris"
+        cube = UsdGeom.Cube.Define(stage, self.path)
+        cube.CreateSizeAttr(1.0)
+        xf = UsdGeom.Xformable(cube)
+        self._translate = xf.AddTranslateOp()
+        self._orient = xf.AddOrientOp()
+        size = cfg.test_obstruction_size_m
+        xf.AddScaleOp().Set(Gf.Vec3f(*(np.array([1.0, 0.7, 0.35]) * size / self.scale).tolist()))
+        mat = UsdShade.Material.Define(stage, f"{self.path}_Material")
+        sh = UsdShade.Shader.Define(stage, f"{self.path}_Material/Shader")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 0.45, 0.05))
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.6)
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(cube.GetPrim()).Bind(mat)
+        self.update(0.0)
+
+    def pose(self, t: float) -> Frame:
+        """Pose in the satellite body frame at time `t` [s]."""
+        c = self.cfg
+        w = 2.0 * np.pi / c.test_obstruction_float_period_s
+        a = c.test_obstruction_float_amplitude_m
+        x, y, z = self.axes[:, 0], self.axes[:, 1], self.axes[:, 2]
+        pos = self.centre + a * (np.sin(w * t) * x + np.sin(0.7 * w * t + 1.0) * y + 0.5 * np.sin(1.3 * w * t) * z)
+        axis = np.array([0.3, 0.8, 0.52])
+        axis /= np.linalg.norm(axis)
+        ang = np.radians(c.test_obstruction_tumble_deg_s) * t
+        k = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+        rot = np.eye(3) + np.sin(ang) * k + (1.0 - np.cos(ang)) * (k @ k)
+        return Frame(pos, self.axes @ rot)
+
+    def update(self, t: float):
+        from pxr import Gf
+
+        f = self.pose(t)
+        self._translate.Set(Gf.Vec3d(*(f.pos / self.scale).tolist()))
+        self._orient.Set(Gf.Quatf(*f.quat))
 
 
 def set_local_pose(stage, path: str, frame: Frame, parent_scale: float = 1.0):

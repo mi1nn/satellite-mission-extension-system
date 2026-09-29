@@ -229,9 +229,13 @@ window.initLive = function () {
     setConnection(connected);
     setProgress(data.progress, data.total_steps);
 
-    stateEl.textContent = data.phase || 'WAITING';
+    // The Astrobee found the docking port blocked: the mission stopped where it was
+    const dockingUnavailable = data.state === 'DOCKING_UNAVAILABLE';
+    stateEl.textContent = dockingUnavailable ? 'DOCKING UNAVAILABLE' : (data.phase || 'WAITING');
     stateEl.classList.toggle('state-failure', Boolean(data.is_failure));
-    phaseEl.textContent = connected ? "ROS2 LIVE TELEMETRY" : "WAITING FOR ROS2";
+    phaseEl.textContent = dockingUnavailable
+      ? 'ASTROBEE: DOCKING PORT BLOCKED'
+      : (connected ? "ROS2 LIVE TELEMETRY" : "WAITING FOR ROS2");
 
     document.getElementById('mission-time').textContent =
       formatTime(data.sim_time_s);
@@ -410,14 +414,25 @@ window.initLive = function () {
     socket = new WebSocket(
       `${protocol}//${location.host}/ws/live`
     );
+    // Binary frames are Astrobee map snapshots (map3d.js); JSON is telemetry
+    socket.binaryType = 'arraybuffer';
 
     socket.addEventListener('open', () => {
       playback.textContent = 'WEBSOCKET CONNECTED';
     });
 
     socket.addEventListener('message', event => {
+      if (typeof event.data !== 'string') {
+        window.dispatchEvent(new CustomEvent('astrobee-map-points', { detail: event.data }));
+        return;
+      }
       try {
-        render(JSON.parse(event.data));
+        const data = JSON.parse(event.data);
+        if (data.astrobee_map) {
+          window.dispatchEvent(new CustomEvent('astrobee-map-status', { detail: data.astrobee_map }));
+        }
+        if (data.type === 'astrobee_map') return;
+        render(data);
       } catch (error) {
         playback.textContent = 'INVALID LIVE DATA';
       }
@@ -425,6 +440,7 @@ window.initLive = function () {
 
     socket.addEventListener('close', () => {
       setConnection(false);
+      window.dispatchEvent(new CustomEvent('astrobee-map-status', { detail: { alive: false } }));
 
       reconnectTimer = setTimeout(connect, 1500);
     });

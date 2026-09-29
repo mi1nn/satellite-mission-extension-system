@@ -145,7 +145,8 @@ source /opt/ros/jazzy/setup.bash
 | `--headless` | Isaac Sim 창 없이 실행. **MISSION VIDEO 는 기록되지 않습니다** (뷰포트 캡처가 GUI 전용) |
 | `--no_dock` | 포착까지만, 도킹 단계 생략 |
 | `--dock_only` | 도킹 단계만 |
-| `--no_astrobee` | Astrobee 관찰 카메라 끔 |
+| `--no_astrobee` | Astrobee 관찰 카메라·위성 맵 끔 (도킹 통로 판정도 생략) |
+| `--nozzle_obstruction` | 위성 도킹부 앞에 떠다니는 시각 전용 부유물 배치 → Astrobee 스캔 맵에서 위성 모델로 설명되지 않는 물체로 감지, 그 즉시 `DOCKING_UNAVAILABLE`로 임무 중단 |
 | `--exit_when_done` | 임무 종료 시 자동 종료 |
 | `--tag NAME` | 출력 파일 이름 |
 | `--set SECTION.KEY=VALUE` | `project/config/vision_capture.yaml` 값 덮어쓰기 (반복 가능) |
@@ -196,10 +197,12 @@ Firestore 에 접근할 수 없으면 캐시본을 내려주고 화면 상단에
 ## 6. 대시보드
 
 **LIVE MISSION** — ROS 2 실시간. Isaac Sim 뷰포트, 임무 상태와 진행률, 속도·각속도·잔여 거리,
-위치 오차 그래프, 카메라 3면(MEP 포착 / 위성 도킹 / Astrobee). PLAY·PAUSE·STOP 으로 시뮬레이터를 제어합니다.
+위치 오차 그래프, 카메라 3면(MEP 포착 / 위성 도킹 / Astrobee)과 CAMERA 4 · ASTROBEE MAP(위성 3D 포인트 맵, 이물질 빨강,
+DOCKING AVAILABLE / UNAVAILABLE). PLAY·PAUSE·STOP 으로 시뮬레이터를 제어합니다.
 
 **TECHNOLOGY VALIDATION** — Firestore 기록. 성공률·실행 횟수·평균 임무 시간·포착 반복 정밀도·도킹 정밀도,
-실행 이력 표, 단계별 텔레메트리 그래프(구간 선택 → JSON 내보내기), 선택 구간의 임무 영상.
+실행 이력 표, 단계별 텔레메트리 그래프(구간 선택 → JSON 내보내기), 선택 구간의 임무 영상,
+실행 종료 시 저장된 Astrobee 맵(`GET /api/validation/runs/{id}/pointcloud`, `.ply`).
 
 ## 7. 저장소 구조
 
