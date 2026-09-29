@@ -186,13 +186,13 @@ def test_rollback_hysteresis_ignores_noise_between_the_thresholds():
     assert back and "lateral" in bad[0]
 
 
-def test_config_defaults_keep_legacy_and_validate_thresholds():
+def test_config_defaults_to_coupled_predictive_and_validate_thresholds():
     cfg = load_vision_config()
-    assert cfg.docking_control.mode == "legacy"  # the verified path stays the default
+    assert cfg.docking_control.mode == "coupled_predictive"
     assert cfg.docking_alignment.position_threshold_m < cfg.docking_alignment.rollback_position_m
     assert cfg.docking_alignment.orientation_threshold_deg < cfg.docking_alignment.rollback_orientation_deg
-    cfg = load_vision_config(overrides=["docking_control.mode=coupled_predictive", "docking_control.prediction_horizon_sec=0.5"])
-    assert cfg.docking_control.mode == "coupled_predictive" and cfg.docking_control.prediction_horizon_sec == 0.5
+    cfg = load_vision_config(overrides=["docking_control.mode=legacy", "docking_control.prediction_horizon_sec=0.5"])
+    assert cfg.docking_control.mode == "legacy" and cfg.docking_control.prediction_horizon_sec == 0.5
     for bad in (["docking_control.mode=smc"],
                 ["docking_alignment.rollback_position_m=0.04"],        # rollback inside the entry band
                 ["docking_alignment.rollback_orientation_deg=20.0"],   # rollback beyond the hard stop
