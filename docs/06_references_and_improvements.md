@@ -1,6 +1,6 @@
 # 06. 논문 레퍼런스와 이를 바탕으로 개선한 기능
 
-기준: 현재 `feature/clean-files`의 legacy controller와 **미병합** `feature/reference-adopt` (`10a45ae`)의 `coupled_predictive` controller. `coupled_predictive`는 기본값이 아니다. Isaac Sim end-to-end 검증이 끝나기 전에는 legacy를 유지한다.
+기준: 현재 `main` (`104b5a7`, 2026-09-29). `feature/reference-adopt`의 `coupled_predictive` controller는 `main`에 병합됐고 현재 YAML의 기본값이다. 아래 legacy 실측과 toy-model 결과는 coupled mode의 Isaac Sim 성능 검증으로 해석하지 않는다.
 
 ## 1. 문제와 수치
 
@@ -14,7 +14,7 @@
 | 0.02 m/s 횡 보정 | ±12 mm; 기존 10 mm gate 초과 | 실측 기록 |
 | active damping gain 1.0 | 0.1 s 안에 발산 | 실측 기록 |
 
-현재 legacy는 진동을 상쇄하지 않고, 가속도 제한 0.01 m/s²·연속 감속·정렬 저속 0.015 m/s로 **자극을 회피**한다. 이동 Client 도킹 반경오차는 39.97–39.98 mm로 40 mm 결합 한계에 근접했다 ([01_business_requirements.md](01_business_requirements.md)).
+과거 legacy 실행은 진동을 상쇄하지 않고, 가속도 제한 0.01 m/s²·연속 감속·정렬 저속 0.015 m/s로 **자극을 회피**했다. 그 실행의 이동 Client 도킹 반경오차는 39.97–39.98 mm로 40 mm 결합 한계에 근접했다 ([01_business_requirements.md](01_business_requirements.md)).
 
 ## 2. 레퍼런스와 현재 반영
 
@@ -41,9 +41,9 @@
 | corridor rollback | lateral >0.20 m 또는 axis >12° | 안전 실패 시 재정렬 |
 | depth gate | 9 px patch, agreement ≤150 mm, 10 calibration samples | blind insertion 금지 |
 
-**구성 불일치:** 설정 `settle_window_s=3.0 s`는 주석의 “20 s 모드의 반주기 이상”과 맞지 않는다. 3 s는 전환점에서 남은 진동을 통과시킬 수 있으므로, reference-adopt의 상대속도+유지시간 gate와 비교 검증해야 한다.
+**legacy 구성 불일치:** 설정 `settle_window_s=3.0 s`는 주석의 “20 s 모드의 반주기 이상”과 맞지 않는다. 3 s는 전환점에서 남은 진동을 통과시킬 수 있으므로, 현재 `main`의 coupled mode가 사용하는 상대속도+유지시간 gate와 비교 검증해야 한다.
 
-## 4. `coupled_predictive` 개선안
+## 4. `coupled_predictive` 구현 (현재 기본 모드)
 
 ### 4.1 legacy 대비
 
@@ -73,13 +73,15 @@ $$\omega_{cmd}=\omega_c+\operatorname{clip}(K_Re_R)-K_{dR}(\omega_{tip}-\omega_c
 | prediction horizon | 0.3 s | 설정값 |
 | $K_p$ position/attitude | 0.15 Hz / 0.15 Hz | 설정값 |
 | $K_d$ position/attitude | 0.6 / 0.6 | 설정값 |
-| 최대 보정 선속도/각속도 | 0.015 m/s / 2°/s | 설정값 |
+| 최대 보정 선속도/각속도 | 0.03 m/s / 2°/s | 현재 설정값 (`docking_control.max_correction_speed_mps`, `max_correction_rate_deg_s`) |
 | soft-gate ramp | lateral 10–80 mm, orientation 1–7° | 설정값 |
 | emergency stop | lateral >150 mm, orientation >12°, nozzle clearance 부족, nozzle 내 상대속도 >0.1 m/s | 설정값 |
 | alignment entry | lateral <50 mm, attitude <4°, \|vrel\|<0.02 m/s, \|ωrel\|<1°/s | 0.5 s 유지 |
 | rollback | lateral >80 mm 또는 attitude >7° | 0.2 s 유지 |
 
-근거는 `git show feature/reference-adopt:docs/prompt/coupled_predictive_docking.md` 및 해당 branch의 `coupled_dock.py`, `vision_capture.yaml`이다.
+현재 설정의 Client 병진 속도 0.02 m/s와 예측 지평 0.3 s를 단순히 곱하면 **6 mm**다. 이는 등속 병진만 고려한 미래 위치 이동량의 계산값이며, 실제 추종 오차 감소량이나 도킹 성능 측정값이 아니다.
+
+근거는 현재 `main`의 `project/srb/tasks/manipulation/debris_capture/coupled_dock.py`, `vision_capture_demo.py`, `project/config/vision_capture.yaml`이다. 원래 설계 기록은 `feature/reference-adopt` 브랜치에 남아 있다.
 
 ## 5. 검증 현황
 
@@ -88,6 +90,6 @@ $$\omega_{cmd}=\omega_c+\operatorname{clip}(K_Re_R)-K_{dR}(\omega_{tip}-\omega_c
 | offline `test_coupled_dock.py` | 21개 test function (문서상 pytest 25/25) | prediction, SO(3), gate, hysteresis, twist estimator 검증 |
 | 1-D payload toy model | command-pose P, Kp=0.2/Kd=0.6: 0.0 mm 수렴, overshoot 12 mm | 실제 Isaac Sim 물리의 증거 아님 |
 | 예측 toy model | 20 mm/s + 0.01 rad/s: T=0 1.23 mm → T=0.3 0.87 mm | 모델 기반 결과 |
-| Isaac Sim coupled | 도킹 전 중단 | 도킹 성공·오차 개선 **미검증** |
+| Isaac Sim coupled | 과거 스모크 2회 도킹 전 중단; 현재 기본 모드의 동일 조건 비교 결과 미확인 | 도킹 성공·오차 개선 **미검증** |
 
 다음 비교는 동일 scenario·seed·초기 pose에서 `legacy`와 `coupled_predictive`를 각각 여러 번 실행하고 성공률, axial/radial/angle/roll 오차, realign 수, 도킹 구간 sim time으로 평가해야 한다. 결과가 없으면 coupling 개선 효과를 주장하지 않는다.

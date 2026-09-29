@@ -21,8 +21,8 @@
 </p>
 
 <p align="center">
-  <img src ="./docs/image/image.png" width="300"> <img src ="./docs/image/image (1).png" width="300">    
-  <img src ="./docs/image/web_ui.png" width="300"> <img src ="./docs/image/point_cloud.png" width="300"> 
+  <img src ="./docs/image/mep_흡착.gif" width="300"> <img src ="./docs/image/docking.gif" width="300">    
+  <img src ="./docs/image/web_ui.png" width="300"> <img src ="./docs/image/pointcloud.gif" width="300"> 
 </p>
 
 ## 0. 시스템 개요
@@ -163,7 +163,7 @@ source /opt/ros/jazzy/setup.bash
 | 4 | DOCK PREP | 도킹 대상 확보, 속도 정합, XY/자세 정렬 |
 | 5 | DOCKING | Z축 접근, 최종 삽입, 도킹 |
 | 6 | DOCK COMPLETE | 안정화, 로봇팔 해제·후퇴, MRV 분리 |
-| 7 | ORBIT TRANSFER | **미구현.** 도킹 완료 실행은 6단계에서 끝납니다 |
+| 7 | ORBIT TRANSFER | 그리퍼 해제·팔 후퇴 후 MRV가 이격되고 `SUCCESS` 뒤에도 계속 이동합니다. 별도의 궤도 이송 제어 상태는 없으며, 현재 대시보드 코드는 이 동작을 6단계에 표시합니다 |
 
 실패 상태는 실패한 단계 번호를 유지합니다 (1단계로 되돌아가지 않음).
 
@@ -191,7 +191,7 @@ source /opt/ros/jazzy/setup.bash
 <summary>Client Satellite · 도킹 대상</summary>
 
 - **역할:** 추력기 노즐 내부의 도킹점을 제공하며, 이동 시나리오에서는 병진 표류합니다.
-- **핵심 기능:** USD 메시에서 도킹 프레임을 측정하고, probe 정렬·깊이·상대속도 조건을 검사해 MEP와 결합합니다. 위성 도킹 pose는 엔진의 물리 상태에서 읽으며 별도 비전 위치 추정이 아닙니다. 7단계 궤도 이송은 구현되지 않았습니다.
+- **핵심 기능:** USD 메시에서 도킹 프레임을 측정하고, probe 정렬·깊이·상대속도 조건을 검사해 MEP와 결합합니다. 위성 도킹 pose는 엔진의 물리 상태에서 읽으며 별도 비전 위치 추정이 아닙니다. 도킹 후 MRV 이격·지속 이동은 구현되어 있지만 도킹 스택의 별도 궤도 변경 기동은 확인되지 않습니다.
 - **코드:** [`docking.py`](project/srb/tasks/manipulation/debris_capture/docking.py), [`probe_dock.py`](project/srb/tasks/manipulation/debris_capture/probe_dock.py), [`moving_dock.py`](project/srb/tasks/manipulation/debris_capture/moving_dock.py)
 
 </details>
@@ -288,7 +288,7 @@ USD·물리를 수정했다면 Isaac Sim 스모크 테스트를 함께 돌리고
 
 ## 9. 알려진 제약
 
-- **7단계(궤도 이송)는 미구현**입니다. 도킹 완료 실행은 6단계에서 종료됩니다.
+- **도킹 후 MRV 이격은 구현**되어 있습니다. 설정상 이격 순항은 0.4 m/s로 15 s이고 최소 거리 증가 판정은 0.1 m입니다. `SUCCESS` 후에도 MRV가 계속 이동합니다. 다만 현재 대시보드의 상태 매핑은 이를 6단계로 표시하며, 별도의 궤도 변경 제어·7단계 텔레메트리는 확인되지 않습니다.
 - **headless 실행에는 MISSION VIDEO 가 없습니다.** 뷰포트 캡처가 GUI 전용입니다.
 - **Firestore 무료 한도**는 하루 읽기 50,000건입니다. 소진되면 대시보드가 캐시본으로 동작하고,
   미국 태평양시 자정에 리셋됩니다.

@@ -4,16 +4,7 @@
 
 ## 1. 통신 경로
 
-```mermaid
-flowchart LR
- S[Isaac Sim] -->|/mrv telemetry, image, status| R[ROS 2 DDS]
- R --> F[firebase_bridge]
- F --> D[(Firestore)]
- R --> A[FastAPI live ROS node]
- D --> A
- A -->|HTTP/JPEG/JSON| U[Browser]
- U -->|POST command| A --> R
-```
+![인터페이스 아키텍처](image/03_interface.png)
 
 ## 2. ROS 2 인터페이스
 
@@ -44,7 +35,7 @@ flowchart LR
 | IR-14 | BR-06 | `simulation_sessions/{session_id}/session_telemetry/{n}` | 시계열 상태·pose·오차·속도 | 기본 sim-time 5 Hz |
 | IR-15 | BR-06 | bridge → Firestore | 배치 기록·재시도 | 400건 batch, 최대 5회; 실패 batch는 유실 가능 |
 
-`session_id` 형식과 영상 동기화는 `README.md:129-144`, 재시도 한계는 `README.md:212-213`을 따른다. 완료 세션은 dashboard cache로 재조회하며, Firestore 접근 불가 시 UI는 `CACHED DATA`를 표시한다 (`README.md:146-152`).
+`session_id` 형식과 영상 동기화는 `README.md`, 재시도 한계는 `README.md`을 따른다. 완료 세션은 dashboard cache로 재조회하며, Firestore 접근 불가 시 UI는 `CACHED DATA`를 표시한다 (`README.md`).
 
 ## 4. HTTP 인터페이스
 
@@ -58,15 +49,15 @@ flowchart LR
 | IR-21 | BR-05 | `GET /api/live/camera{1,2,3}.jpg`, `/api/live/viewport.jpg` | 최신 JPEG; ROS 없음은 204 |
 | IR-22 | BR-05 | `POST /api/live/command/{command}` | `start/pause/resume/abort`; 그 외 400, ROS 없음 503 |
 
-근거: `mep_dashboard/backend/app.py:772-1050`. 브라우저는 LIVE에서 3 카메라·viewport·상태·7단계 진행률을, VALIDATION에서 성공률·정밀도·시간·시계열·영상 구간을 제공한다 (`README.md:154-160`).
+근거: `mep_dashboard/backend/app.py:772-1050`. 브라우저는 LIVE에서 3 카메라·viewport·상태·7단계 진행률을, VALIDATION에서 성공률·정밀도·시간·시계열·영상 구간을 제공한다 (`README.md`).
 
 ## 5. 파일·CLI 인터페이스
 
 | 대상 | 계약 |
 |---|---|
-| 설정 | `project/config/vision_capture.yaml`: `mep`, `camera`, `apriltag`, `vision`, `prediction`, `approach`, `capture`, `test`, `logging`, `ros`, `mrv`, `docking`, `probe_camera`, `post_docking`, `separation`, `astrobee` |
+| 설정 | `project/config/vision_capture.yaml`: `mep`, `camera`, `apriltag`, `vision`, `prediction`, `approach`, `capture`, `test`, `logging`, `ros`, `mrv`, `docking`, `docking_control`, `docking_alignment`, `probe_camera`, `client`, `rendezvous`, `post_docking`, `separation`, `astrobee` |
 | 진입점 | `vision_capture.py --scenario {static,dynamic} --headless --config PATH --set SECTION.KEY=VALUE --tag NAME` |
 | 임무 제어 | `--dock/--no_dock`, `--dock_only`, `--moving_dock/--no_moving_dock`, `--mrv_approach/--no_mrv_approach`, `--no_astrobee`, `--ros/--no_ros`, `--ros_wait_start` |
 | 로그 | `project/logs/vision_capture/<tag>_*.csv`, `<tag>_result.json`, GUI 시 `<session_id>.mp4` 및 `.video.json` |
 
-근거: `vision_capture.py:47-81`, `vision_capture.yaml:196-211`, `README.md:99-109,138-144`.
+근거: `vision_capture.py:47-81`, `vision_capture.yaml:196-211`, `README.md`.

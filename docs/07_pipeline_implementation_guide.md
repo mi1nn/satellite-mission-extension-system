@@ -4,7 +4,7 @@
 
 1. 시뮬레이션을 실행하면 MRV, Canadarm3, MEP, Client Satellite, Astrobee가 어떤 순서로 움직이는가
 2. 화면에서 보이는 동작이 코드와 Isaac Sim 물리 안에서 어떻게 구현되어 있는가
-3. 어떤 논문의 아이디어를 실제 제어기에 반영했으며, 어떤 내용은 아직 연구 브랜치에만 있는가
+3. 어떤 논문의 아이디어를 실제 제어기에 반영했으며, 어떤 효과는 아직 검증되지 않았는가
 
 설치와 실행 명령은 루트 [README.md](../README.md), 정확한 요구조건과 수치는 [02_system_requirements.md](02_system_requirements.md), 토픽과 API는 [03_interface_requirements.md](03_interface_requirements.md)를 참고합니다.
 
@@ -14,19 +14,9 @@
 
 **MRV가 표류·회전하는 3,000 kg MEP를 Canadarm3의 손목 카메라로 찾아 붙잡고, MEP 끝의 Ares1 probe를 표류하는 Client Satellite의 추력기 노즐에 삽입한 뒤, MEP를 위성에 남겨 두고 물러나는 임무를 Isaac Sim에서 실행하는 프로젝트입니다.**
 
-Astrobee는 이 작업을 제어하지 않고 주변을 비행하면서 카메라로 관찰합니다. ROS 2와 웹 대시보드는 임무를 시작·중지하고 상태, 영상, 오차, 실행 결과를 기록합니다.
+Astrobee는 팔·도킹 제어 명령을 내리지 않습니다. 주변을 비행하며 관찰한 depth 맵으로 도킹 통로의 장애물을 판정하고, 그 결과를 임무의 안전 게이트에 제공합니다. ROS 2와 웹 대시보드는 임무를 시작·중지하고 상태, 영상, 오차, 실행 결과를 기록합니다.
 
-```mermaid
-flowchart LR
-  OP[운영자/웹] -->|PLAY| MRV[MRV + Canadarm3]
-  MRV -->|AprilTag 탐색| MEP[3,000 kg MEP]
-  MRV -->|FixedJoint로 포획| MEP
-  MEP -->|Ares1 probe 삽입| SAT[Client Satellite]
-  MEP -->|FixedJoint로 도킹| SAT
-  MRV -->|포획 joint 해제·분리| SAT
-  AST[Astrobee] -.카메라 관찰.-> MRV
-  AST -.카메라 관찰.-> SAT
-```
+![전체](image/07_all.png)
 
 ---
 
@@ -40,7 +30,7 @@ flowchart LR
 | **그리퍼/포획부** | MEP 부착면을 붙잡음 | 실제 흡입력이나 전자석 힘을 계산하지 않고, 조건 만족 시 `UsdPhysics.FixedJoint`를 만듭니다. | `capture.py:1-12,330-369` |
 | **Ares1 probe** | MEP와 위성 사이의 도킹 핀 | MEP 메시에서 축·끝점·반경을 실행 시 측정합니다. | `docking.py:157-176,371-380` |
 | **Client Satellite** | MEP를 인수하는 목표 위성 | GOES-R 추력기 노즐의 축과 내부 도킹점을 실행 시 측정하며, moving 시나리오에서는 동적 강체로 표류합니다. | `docking.py:382-393`, `moving_dock.py` |
-| **Astrobee** | 임무 관찰 카메라 | collider와 rigid body가 없는 시각 모델을 정해진 경로로 운동학적으로 이동합니다. 임무 판단에는 관여하지 않습니다. | `astrobee.py:1-38` |
+| **Astrobee** | 임무 관찰 카메라·도킹 통로 안전 게이트 | collider와 rigid body가 없는 시각 모델을 정해진 경로로 운동학적으로 이동합니다. depth 맵의 통로 판정을 임무 상태 머신이 읽습니다. | `astrobee.py`, `astrobee_map.py`, `vision_capture_demo.py` |
 
 ### “그리퍼 흡착”의 정확한 의미
 
@@ -60,24 +50,7 @@ flowchart LR
 
 주 상태 머신은 `vision_capture_demo.py:109-176`의 `State` enum입니다. 매 물리 step 전에 `VisionCaptureDemo.step()`이 현재 상태에 맞는 제어 함수를 한 번 실행합니다.
 
-```mermaid
-flowchart TD
-  INIT --> MOVE1[MRV MOVE STEP 1]
-  MOVE1 --> MOVE2[MRV MOVE STEP 2]
-  MOVE2 --> DEPLOY[ARM DEPLOY]
-  DEPLOY --> SEARCH
-  SEARCH --> DETECT[TAG DETECT / POSE ESTIMATE]
-  DETECT --> APPROACH[PREDICT / APPROACH]
-  APPROACH --> CAPTURE[CAPTURE / HOLD]
-  CAPTURE --> RELEASE_CLIENT[CLIENT RELEASE / RENDEZVOUS]
-  RELEASE_CLIENT --> PRE[PRE-DOCK]
-  PRE --> ALIGN[XY + ORIENTATION ALIGN]
-  ALIGN --> INSERT[Z APPROACH / FINAL INSERTION]
-  INSERT --> DOCKED
-  DOCKED --> STABLE[STABILIZE / ROBOT RELEASE]
-  STABLE --> SEPARATE[ARM RETREAT / MRV SEPARATION]
-  SEPARATE --> SUCCESS
-```
+![상태머신](image/07_state.png)
 
 웹의 7단계는 내부 상태를 이해하기 쉽게 묶은 표현입니다.
 
@@ -89,7 +62,7 @@ flowchart TD
 | 4. DOCK PREP | Client release, 속도 정합, pre-dock 위치 이동, 횡·자세 정렬 |
 | 5. DOCKING | 깊이 확인, Z축 접근, 최종 삽입, MEP–Satellite FixedJoint 생성 |
 | 6. DOCK COMPLETE | 안정화, Canadarm3–MEP joint 제거, 팔·MRV 후퇴 |
-| 7. ORBIT TRANSFER | 표시만 있으며 현재 미구현 |
+| 7. ORBIT TRANSFER | 그리퍼 해제·MRV 분리 후 `SUCCESS`에서도 MRV가 지속 이동. 현재 웹 상태 매핑은 6단계이며 별도 궤도 변경 상태·7단계 텔레메트리는 없음 |
 
 ---
 
@@ -119,17 +92,7 @@ MEP의 정답 좌표를 제어기에 직접 넘기면 움직이는 물체를 센
 
 ### 처리 순서
 
-```mermaid
-flowchart LR
-  IMG[1280×720 RGB] --> TAG[Tag 0~3 검출]
-  TAG --> PNP[solvePnP / IPPE]
-  PNP --> TC[Camera→Tag pose]
-  TC --> WT[World→Tag pose]
-  WT --> CYL[MEP 결합점 pose]
-  CYL --> FILTER[시간창 속도·각속도 추정]
-  FILTER --> FUTURE[0.3 s 미래 pose]
-  FUTURE --> IK[Canadarm3 IK target]
-```
+![apriltag](image/07_april.png)
 
 - 태그 family: `tag36h11`
 - 태그 수와 ID: 4개, `0~3`
@@ -211,7 +174,11 @@ $$T_D^P=(T_W^D)^{-1}T_W^P$$
 - X/Y: 노즐 중심축에서 얼마나 벗어났는가
 - 회전: probe 축과 노즐 축, roll이 얼마나 다른가
 
-### legacy 제어 순서
+### 기본 `coupled_predictive` 제어 순서
+
+`PRE_DOCK_APPROACH → POSITION_ATTITUDE_ALIGN → ALIGNMENT_CHECK → Z_APPROACH → FINAL_INSERTION → DOCK_READY` 순으로 실행합니다. 예측한 Client 도킹 pose를 위치·자세로 동시에 추종하며, 정렬 조건은 상대 선속도·각속도를 포함해 0.5 s 연속 만족해야 합니다. 현재 보정 선속도 상한은 0.03 m/s입니다 (`docking_control`, `docking_alignment`). 이 모드가 기본값이라는 사실은 legacy 대비 Isaac Sim 성능 개선이 검증됐다는 뜻이 아닙니다.
+
+### `legacy` 제어 순서
 
 1. **PRE_DOCK_APPROACH**: probe tip을 노즐 앞 1 m 지점으로 운반
 2. **XY_ALIGN**: 횡오차 보정
@@ -263,17 +230,17 @@ Canadarm3 -- capture_joint -- MEP -- docking_joint -- Client Satellite
 
 ## 11. Astrobee는 무엇을 하고 무엇을 하지 않는가
 
-Astrobee는 위성 주변 관측점 4개(45°, 135°, 225°, 315°)를 순회하며 각 지점에 5 s 머뭅니다. 카메라는 640×480 영상을 5 Hz로 `/astrobee/camera/image_raw`에 발행합니다.
+Astrobee는 도킹 포트 근접 관측점에서 시작해 위성 위·아래 두 링을 각 4방위(45°, 135°, 225°, 315°)로 순회하며 지점마다 5 s 머뭅니다. 카메라는 640×480 영상을 5 Hz로 `/astrobee/camera/image_raw`에 발행합니다.
 
 도킹 완료 상태를 받으면 관측 loop를 끝내고, 분리되는 MRV를 10 m 거리까지 따라갑니다 (`astrobee.py`).
 
 **위성 외형 맵과 도킹 가능 판정** (`astrobee_map.py`, 설정 `astrobee.map`):
 
-- 각 관측점 dwell 중 2회 depth(`distance_to_image_plane`)를 샘플링해 8 px 그리드(샘플마다 이동) + 도킹 포트 주변 전 픽셀을
+- 각 관측점 dwell 중 3회 depth(`distance_to_image_plane`)를 샘플링하고, 이동 중에도 1 s 간격으로 샘플링합니다. 4 px 그리드(샘플마다 이동) + 도킹 포트 주변 1 px 간격의 픽셀을
   역투영합니다. 카메라 포즈는 렌더에 쓴 `camera_world_pose`이며 포즈 추정은 없습니다.
-- 점은 위성 프레임으로 옮겨 5 cm 보셀에 누적하고(샘플당 +1), 카메라가 관통해 본 보셀은 −1로 지웁니다(free-space carving).
+- 점은 위성 프레임으로 옮겨 3 cm 보셀에 누적하고(샘플당 +1), 카메라가 관통해 본 보셀은 −1로 지웁니다(free-space carving).
   서비서 자신의 probe는 매핑하지 않습니다.
-- **장애물 판정 = 스캔 맵 − 기존 3D 모델.** 위성 USD 메시 표면을 2.5 cm 간격으로 샘플링한 모델 보셀(1보셀 팽창)로 설명되는
+- **장애물 판정 = 스캔 맵 − 기존 3D 모델.** 위성 USD 메시 표면을 1.5 cm 간격으로 샘플링한 모델 보셀(1보셀 팽창)로 설명되는
   보셀은 위성 자체(노즐 벽·테두리 링·구조물)이고, 서비서 MEP(probe 포함)는 자기 모델로 매핑 단계에서 제외합니다.
   남은 확정 보셀(2회 이상) 중 **도킹 금지 구역** 안에 있는 것이 장애물입니다.
 - **도킹 금지 구역(어디까지를 장애물로 볼지):** 노즐 안쪽(출구 ~ back plate 0.05 m 앞, 반경 = 내경 − 0.02 m) + 출구 앞
@@ -324,9 +291,9 @@ Firestore는 실행 요약과 기본 5 Hz telemetry를 저장합니다. 웹 LIVE
 
 ## 13. 논문에서 가져온 아이디어
 
-논문은 모두 같은 수준으로 코드에 반영된 것이 아닙니다. 아래처럼 **현재 legacy에 반영**, **reference-adopt 브랜치에 구현**, **검토만 하고 미채택**을 구분해야 합니다.
+논문은 모두 같은 수준으로 코드에 반영된 것이 아닙니다. 아래처럼 **legacy 제어에 반영**, **현재 기본 `coupled_predictive`에 구현**, **검토만 하고 미채택**을 구분해야 합니다. 제어기 병합·기본값 변경과 Isaac Sim 성능 검증도 별개입니다.
 
-### 13.1 현재 legacy에 반영된 제어 원리
+### 13.1 `legacy`에 반영된 제어 원리
 
 #### Singer & Seering (1990) — Input Shaping
 
@@ -344,7 +311,7 @@ Firestore는 실행 요약과 기본 5 Hz telemetry를 저장합니다. 웹 LIVE
 
 핵심은 구동부 이동과 비구동 swing을 연속적으로 결합하고, swing이 안전 한계에 가까워질수록 전진을 줄이는 것입니다.
 
-legacy는 연속 감속과 corridor rollback으로 일부 개념만 반영합니다. 완전한 barrier Lyapunov controller는 아닙니다. 이 아이디어는 `reference-adopt`의 smooth soft gate 설계에 더 직접적으로 반영되었습니다.
+legacy는 연속 감속과 corridor rollback으로 일부 개념만 반영합니다. 완전한 barrier Lyapunov controller는 아닙니다. 이 아이디어는 현재 `main`의 `coupled_predictive` smooth soft gate 설계에 더 직접적으로 반영되었습니다.
 
 #### Aghili (2009) — heavy-payload impedance control
 
@@ -352,9 +319,9 @@ legacy는 연속 감속과 corridor rollback으로 일부 개념만 반영합니
 
 따라서 이 논문은 **성공적으로 적용된 기능**이라기보다, 현재 damping 항이 왜 비활성이고 앞으로 어떤 방식으로 안정 gain을 구해야 하는지 설명하는 근거입니다.
 
-### 13.2 `feature/reference-adopt`에 구현한 개선
+### 13.2 현재 `main`에 병합된 `coupled_predictive` 구현
 
-이 브랜치는 현재 작업 브랜치에 아직 merge되지 않았으며 Isaac Sim end-to-end 검증도 완료되지 않았습니다.
+이 제어기는 `feature/reference-adopt`에서 개발돼 현재 `main`에 병합됐고 YAML 기본값으로 설정됐습니다. legacy 대비 Isaac Sim end-to-end 성공률·오차 개선은 아직 확인되지 않았습니다.
 
 #### Zhou, Liu, Cai — *Motion-planning and pose-tracking based rendezvous and docking with a tumbling target*
 
@@ -417,10 +384,10 @@ legacy는 연속 감속과 corridor rollback으로 일부 개념만 반영합니
 
 ## 15. 현재 한계
 
-- 7단계 `ORBIT TRANSFER`는 미구현입니다.
+- 도킹 후 MRV 이격·지속 이동은 구현되어 있습니다. 별도 궤도 변경 상태와 대시보드 7단계 상태 매핑·텔레메트리는 현재 코드에서 확인되지 않습니다.
 - MRV 이동과 Astrobee 비행은 실제 thruster dynamics가 아니라 운동학적 이동입니다.
 - Astrobee의 판단은 depth 맵 기반 도킹 통로 이물질 판정 하나이며, 포즈는 시뮬레이터 값(GT)을 씁니다.
 - 회전하는 Client Satellite 도킹은 검증된 구성에 포함하지 않습니다.
 - gripper 포획과 MEP 도킹은 접촉 mechanics·latch 구조를 상세 모델링하지 않고 `FixedJoint`로 근사합니다.
 - headless 실행에서는 GUI viewport 기반 임무 영상이 생성되지 않습니다.
-- `reference-adopt`의 coupled predictive controller는 offline 검증 단계이며, legacy 대비 Isaac Sim 성공률·오차 개선을 아직 주장할 수 없습니다.
+- `coupled_predictive`는 현재 기본 모드지만, legacy 대비 Isaac Sim 성공률·오차 개선을 입증하는 동일 조건 비교 결과는 확인되지 않았습니다.

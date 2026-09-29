@@ -2,6 +2,7 @@
 
 | # | 문서 | 내용 |
 |---|---|---|
+| 0 | [00_team_onboarding.md](00_team_onboarding.md) | **팀 온보딩** — 시스템 아키텍처·플로우 다이어그램으로 15분 안에 구조 파악 |
 | 1 | [01_business_requirements.md](01_business_requirements.md) | 비즈니스 요구사항 (BR-01~08), KPI, 범위, 로드맵 |
 | 2 | [02_system_requirements.md](02_system_requirements.md) | 시스템 요구사항 (SR-F / SR-N), 실행 환경, BR→SR 추적 |
 | 3 | [03_interface_requirements.md](03_interface_requirements.md) | ROS 2 토픽, Firestore 스키마, REST API, 설정·CLI·로그 파일, UI |
