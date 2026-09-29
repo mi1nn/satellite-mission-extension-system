@@ -24,8 +24,12 @@ Must run with the Isaac Sim Python (the same interpreter `srb` uses):
     # Astrobee observation camera (on by default): flies around the satellite, image on
     # /astrobee/camera/image_raw (with ROS 2); --no_astrobee leaves it out
     ~/isaac-sim/python.sh project/scripts/vision_capture.py --no_astrobee
-    # GUI (debug draw + camera overlay images); after a success the simulation keeps
-    # running with the MEP held until the window is closed (--exit_when_done to quit)
+    # ... it also maps the satellite from depth and checks the docking corridor; debris
+    # floating at the docking port must end the run in DOCKING_UNAVAILABLE (not --dock_only:
+    # the MEP then hides the port from the Astrobee from the start)
+    ~/isaac-sim/python.sh project/scripts/vision_capture.py --no_moving_dock --nozzle_obstruction --tag blocked
+    # GUI (debug draw + camera overlay images); after a success (or DOCKING_UNAVAILABLE) the simulation keeps
+    # running (robot holding, Astrobee scanning) until the window is closed (--exit_when_done to quit)
     ~/isaac-sim/python.sh project/scripts/vision_capture.py --scenario dynamic
 
 Config: `project/config/vision_capture.yaml`; override any value with
@@ -74,6 +78,9 @@ def parse_args():
     parser.add_argument("--no_astrobee", action="store_true",
                         help="Leave out the Astrobee observation camera (default: on, config `astrobee:`; its image is "
                              "published on /astrobee/camera/image_raw when ROS 2 is on)")
+    parser.add_argument("--nozzle_obstruction", action="store_true",
+                        help="Float a visual-only piece of debris at the satellite's docking port: the Astrobee map "
+                             "must report it and the mission must end in DOCKING_UNAVAILABLE before inserting the probe")
     parser.add_argument("--no_ros", action="store_true", help="Disable the ROS 2 interface (default: on)")
     parser.add_argument("--ros", action="store_true",
                         help="Enable the ROS 2 interface (default: on) (telemetry topics + cmd/start, cmd/abort, cmd/capture_enable; see config `ros:`)")
@@ -189,6 +196,10 @@ def main():
         sets.append("mrv.enabled=false")
     if args.no_astrobee:
         sets.append("astrobee.enabled=false")
+    if args.nozzle_obstruction:
+        if args.no_astrobee:
+            sys.exit("[ARGS] --nozzle_obstruction needs the Astrobee (drop --no_astrobee)")
+        sets.append("astrobee.map.test_obstruction=true")
     if args.no_ros:
         sets.append("ros.enabled=false")
     elif args.ros or args.ros_wait_start:
@@ -242,8 +253,10 @@ def main():
         state["ok"] = n_ok == len(results.checks)
         # Keep the scene up after the run reached SUCCESS, even if a report-only check
         # failed (the exit code below still carries every check)
-        if not args.headless and results.final_state == "SUCCESS" and not args.exit_when_done:
-            demo.idle()  # results are already written; keep the scene up until the window closes
+        # SUCCESS, or stopped by the Astrobee (docking unavailable): results are already
+        # written; keep the scene up (Astrobee still scanning) until the window closes
+        if not args.headless and results.final_state in ("SUCCESS", "DOCKING_UNAVAILABLE") and not args.exit_when_done:
+            demo.idle()
         demo.close_astrobee()
         env.close()
 

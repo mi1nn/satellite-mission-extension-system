@@ -73,7 +73,7 @@ window.initValidation = async function () {
       index: 5,
       key: 'DOCKING',
       label: '도킹',
-      states: ['Z_APPROACH', 'FINAL_INSERTION', 'DOCK_READY', 'DOCKED', 'DOCK_FAILED'],
+      states: ['Z_APPROACH', 'FINAL_INSERTION', 'DOCK_READY', 'DOCKING_UNAVAILABLE', 'DOCKED', 'DOCK_FAILED'],
       metrics: [
         ['dock_geometry_distance_m', 'Docking Distance', ' m'],
         ['dock_lateral_error_m', 'Lateral Error', ' m'],
@@ -271,8 +271,25 @@ window.initValidation = async function () {
     ];
     if (run.failureStage) rows.push(['Failure Stage', text(run.failureStage)]);
     if (run.failureReason) rows.push(['Failure Reason', text(run.failureReason)]);
-    $('run-info').innerHTML = `<dl>${rows.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>`;
+    const cloud = pointClouds.get(run.sessionId);
+    const cloudRow = cloud
+      ? `<div><dt>Astrobee Map</dt><dd><a href="${esc(cloud)}" download>POINT CLOUD (.PLY) ↓</a></dd></div>`
+      : '';
+    $('run-info').innerHTML = `<dl>${rows.map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(value)}</dd></div>`).join('')}${cloudRow}</dl>`;
   };
+
+  // Astrobee map of a run (`<id>.ply` saved by firebase_bridge.py at the session end)
+  const pointClouds = new Map();
+  async function loadPointCloud(run, token, recordCount) {
+    if (pointClouds.has(run.sessionId)) return;
+    const url = `/api/validation/runs/${encodeURIComponent(run.sessionId)}/pointcloud`;
+    let available = false;
+    try {
+      available = (await fetch(url, { method: 'HEAD', cache: 'no-store' })).ok;
+    } catch (_) { /* offline: no link */ }
+    pointClouds.set(run.sessionId, available ? url : null);
+    if (available && token === selectionToken) renderRunInfo(run, recordCount());
+  }
 
   const renderHistory = list => {
     $('run-history').innerHTML = [...list].reverse().map((run, index) =>
@@ -638,6 +655,7 @@ window.initValidation = async function () {
     $('metric-selector').innerHTML = '';
     setPlaceholder('LOADING TELEMETRY…');
     loadVideo(run, token);
+    loadPointCloud(run, token, () => (telemetry.length ? telemetry.length : null));
 
     try {
       const response = await window.ValidationFirestore.loadTelemetry(run.sessionId);

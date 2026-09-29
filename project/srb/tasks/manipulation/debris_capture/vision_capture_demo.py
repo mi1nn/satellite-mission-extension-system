@@ -174,12 +174,17 @@ class State(Enum):
     ARM_RETREAT_FAILED = "ARM_RETREAT_FAILED"
     SEPARATION_COLLISION = "SEPARATION_COLLISION"
     SEPARATION_FAILED = "SEPARATION_FAILED"
+    # The Astrobee map (`astrobee_map.py`) sees an object in the nozzle's insertion
+    # corridor (or has not seen into it): final verdict instead of DOCK_READY, the run
+    # ends here. DOCKING_AVAILABLE is DOCK_READY itself, entered with a clear corridor.
+    DOCKING_UNAVAILABLE = "DOCKING_UNAVAILABLE"
 
 
 FAILURES = {State.TAG_LOST, State.POSE_INVALID, State.PREDICTION_INVALID, State.APPROACH_TIMEOUT, State.CAPTURE_FAILED, State.PHYSICS_ERROR,
             State.ABORTED, State.DOCK_FAILED, State.MRV_APPROACH_FAILED,
             State.CLIENT_RELEASE_FAILED, State.VELOCITY_MATCH_TIMEOUT, State.RENDEZVOUS_TIMEOUT, State.STOP_FAILED,
-            State.ROBOT_RELEASE_FAILED, State.ARM_RETREAT_FAILED, State.SEPARATION_COLLISION, State.SEPARATION_FAILED}
+            State.ROBOT_RELEASE_FAILED, State.ARM_RETREAT_FAILED, State.SEPARATION_COLLISION, State.SEPARATION_FAILED,
+            State.DOCKING_UNAVAILABLE}
 # MRV rendezvous phase: no vision, no capture, no docking runs in any of them
 MRV_STATES = {State.MRV_MOVE_STEP_1, State.MRV_STEP_1_REACHED, State.MRV_MOVE_STEP_2,
               State.MRV_STEP_2_REACHED, State.ARM_DEPLOY}
@@ -454,9 +459,10 @@ class VisionCaptureDemo:
         self._rendered_frame_count = 0
         self._start_wait_logged = False
         self._capture_wait_logged = False
-        ## Astrobee observation camera (`astrobee.py`): flies and streams its camera only;
-        ## nothing of the mission reads it. Its one input is the existing latched state
-        ## topic `/<ros.namespace>/state` (docking complete -> follow the MRV retreat).
+        ## Astrobee observation camera + satellite map (`astrobee.py`): the mission reads
+        ## only its docking clearance (`docking_clearance()`, before DOCK_READY). Its one
+        ## input is the existing latched state topic `/<ros.namespace>/state` (docking
+        ## complete -> follow the MRV retreat).
         ## Created before the vision ROS node so the camera feed (which keeps going in
         ## `idle()`) owns the rclpy context.
         self.astrobee = None
@@ -1314,10 +1320,12 @@ class VisionCaptureDemo:
         return self.sim_time - self._capture_t0
 
     def idle(self):
-        """GUI after a successful run: keep simulating (MEP held) until the window closes."""
+        """GUI after SUCCESS / DOCKING_UNAVAILABLE: keep simulating (robot holding, Astrobee
+        scanning) until the window closes."""
         sim, scene = self.sim, self.scene
         self.q_hold = self.arm.joint_pos().clone()
-        print("[DEMO] Scenario finished -- the simulation keeps running with the MEP held. Close the Isaac Sim window to exit.", flush=True)
+        print(f"[DEMO] Scenario finished ({self.state.value}) -- the simulation keeps running, the robot holds its pose. "
+              "Close the Isaac Sim window to exit.", flush=True)
         n = 0
         with torch.no_grad():
             while self.sim_app.is_running():
@@ -1329,6 +1337,8 @@ class VisionCaptureDemo:
                 t_obs = self.sim_time + n * self.dt
                 if self.astrobee is not None:
                     self.astrobee.step(t_obs, self.state.value)
+                if self.task.floating_debris is not None:
+                    self.task.floating_debris.update(t_obs)
                 scene.write_data_to_sim()
                 sim.step(render=False)
                 n += 1
@@ -1357,6 +1367,11 @@ class VisionCaptureDemo:
             if self.ros.abort_requested and s not in TERMINAL:
                 self.goto(State.ABORTED, "ROS cmd/abort")
                 s = self.state
+
+        ## Astrobee: a foreign object in the docking keep-out zone -> docking unavailable,
+        ## the mission stops at once (whatever it is doing)
+        if self.astrobee_stop():
+            s = self.state
 
         if self._mv_active:
             self.moving_measure()
@@ -2128,6 +2143,8 @@ class VisionCaptureDemo:
             self.results.check("[DOCK2] Alignment before the docking-axis approach", True,
                                f"lateral {m['lateral']*1000:.2f} mm (<= {d.align_lateral_m*1000:.0f}), axis {m['axis_deg']:.3f} deg (<= {d.align_axis_deg}), "
                                f"roll {m['roll_deg']:.3f} deg (<= {d.align_roll_deg}), held {d.align_hold_s:.1f} s")
+            if self.corridor_blocked("before the docking-axis approach"):
+                return
             print(f"[DOCK] alignment check passed; starting the docking-axis approach "
                   f"(remaining {m['geometry_distance']:.3f} m, depth {m['depth_distance']:.3f} m)", flush=True)
             self.goto(State.Z_APPROACH)
@@ -2184,14 +2201,60 @@ class VisionCaptureDemo:
                   f"wall clearance {m['clearance']*1000:.0f} mm)", flush=True)
             return self.goto(State.FINAL_INSERTION)
         if final and abs(m["axial"]) <= d.dock_axial_m:
-            return self.goto(State.DOCK_READY)
+            if self.corridor_blocked("before DOCK_READY"):
+                return
+            clear = self.docking_clearance()
+            return self.goto(State.DOCK_READY, "" if clear is None else f"DOCKING_AVAILABLE (Astrobee map: {clear.summary()})")
         self._dock_stage_timeout(m)
+
+    def astrobee_stop(self) -> bool:
+        """Stop the mission (DOCKING_UNAVAILABLE) as soon as the Astrobee map confirms an
+        obstruction in the docking keep-out zone (`astrobee.map.stop_mission_on_obstruction`).
+        Not before the mission started, not once it ended or the MEP is docked, and not on
+        a run without docking. An unobserved zone does not stop it (the gates handle that)."""
+        s = self.state
+        if (s == State.INIT or s in TERMINAL or s in (State.DOCKED, State.DOCK_HOLDING) or s in MOVING_POST_DOCK
+                or not self.cfg.docking.enabled or not self.cfg.astrobee.map.stop_mission_on_obstruction):
+            return False
+        clear = self.docking_clearance()
+        if clear is None or not clear.observed or clear.is_clear:
+            return False
+        self.results.check("[DOCK3M] Docking corridor clear (Astrobee map)", False, f"during {s.value}: {clear.summary()}")
+        print(f"[MISSION] STOP: docking unavailable -- the Astrobee map found a foreign object in the docking keep-out zone "
+              f"({clear.summary()}); stopping in {s.value}", flush=True)
+        self.goto(State.DOCKING_UNAVAILABLE, f"Astrobee map: {clear.summary()} -- mission stopped")
+        return True
+
+    def corridor_blocked(self, where: str, record_pass: bool = True) -> bool:
+        """Astrobee corridor gate: not clear -> DOCKING_UNAVAILABLE (the final verdict of
+        the run). Checked before the probe starts along the docking axis (Z_APPROACH),
+        and again on the way into / inside DOCK_READY."""
+        clear = self.docking_clearance()
+        if clear is None:
+            return False
+        if clear.is_clear:
+            if record_pass:
+                self.results.check("[DOCK3M] Docking corridor clear (Astrobee map)", True, f"{where}: {clear.summary()}")
+            return False
+        self.results.check("[DOCK3M] Docking corridor clear (Astrobee map)", False, f"{where}: {clear.summary()}")
+        self.goto(State.DOCKING_UNAVAILABLE, f"Astrobee map, {where}: {clear.summary()}")
+        return True
+
+    def docking_clearance(self):
+        """Astrobee corridor check (`astrobee_map.DockingClearance`), or None when it does
+        not gate the docking (no Astrobee, map off, or `astrobee.map.gate_docking` false)."""
+        a = self.astrobee
+        if a is None or a.map is None or not self.cfg.astrobee.map.gate_docking:
+            return None
+        return a.docking_clearance()
 
     def step_dock_ready(self, m):
         """Every docking condition is re-checked here; only then is the joint created."""
         d = self.cfg.docking
         self.track_probe(probe_dock.tip_goal(self.dock_world(), 0.0), d.insertion_speed_mps,
                          max_step=0.5 * self.cfg.approach.max_joint_step_rad)
+        if self.corridor_blocked("at DOCK_READY", record_pass=False):  # every step: log only a change
+            return
         valid, why = self.docking_tracking_valid()
         ready, bad = probe_dock.dock_ready(d, m, m["rel_speed"], bool(m["depth_ok"]) or self.forced_insertion(), valid, m["clearance"])
         if self._mv_active:
@@ -2716,6 +2779,8 @@ class VisionCaptureDemo:
             self.results.check("[DOCK2] Alignment before the docking-axis approach", True,
                                f"forced insertion corridor: lateral {m['lateral']*1000:.2f} mm (<= {self.cfg.rendezvous.insertion_max_lateral_m*1000:.0f}), "
                                f"axis {m['axis_deg']:.3f} deg (<= {self.cfg.rendezvous.insertion_max_axis_deg:g}), held {d.align_hold_s:.1f} s")
+            if self.corridor_blocked("before the docking-axis approach"):
+                return
             print(f"[DOCK] forced insertion: starting the docking-axis approach (lateral {m['lateral']*1000:.1f} mm, "
                   f"axis {m['axis_deg']:.2f} deg, remaining {m['geometry_distance']:.3f} m)", flush=True)
             self.goto(State.Z_APPROACH)
@@ -3882,6 +3947,8 @@ class VisionCaptureDemo:
                         self.client_live_step()  # client drifting since t = 0 (MRV still static)
                     if self.astrobee is not None:
                         self.astrobee.step(self.sim_time, self.state.value)
+                    if self.task.floating_debris is not None:
+                        self.task.floating_debris.update(self.sim_time)
                     scene.write_data_to_sim()
                     sim.step(render=False)
                     n += 1
@@ -3958,6 +4025,25 @@ class VisionCaptureDemo:
             r.metrics.setdefault("mrv_approach", dict(self._mrv_log))
             r.metrics["capture_phase_start_s"] = self._capture_t0
         r.metrics["wall_time_s"] = time.time() - self.wall_start
+        if self.astrobee is not None and self.astrobee.map is not None:
+            a = self.astrobee
+            cl = a.docking_clearance()
+            r.metrics["astrobee_map"] = {
+                "depth_frames": a.map.frames, "voxels": len(a.map), "confirmed_voxels": int(len(a.map.confirmed())),
+                "voxel_size_m": a.map.voxel, "gate_docking": bool(self.cfg.astrobee.map.gate_docking),
+                "test_obstruction": bool(self.cfg.astrobee.map.test_obstruction),
+                "clearance": {"is_clear": cl.is_clear, "observed": cl.observed, "corridor_views": cl.corridor_views,
+                              "obstruction_voxels": cl.obstruction_voxels,
+                              "nearest_m": cl.nearest_m if math.isfinite(cl.nearest_m) else None},
+            }
+            if self.cfg.astrobee.map.save_ply:
+                try:
+                    ply = a.save_map(self.out_dir / f"{self.label}_astrobee_map.ply")
+                    r.metrics["astrobee_map"]["ply"] = str(ply) if ply is not None else None
+                    if ply is not None:
+                        print(f"[ASTROBEE] map saved: {ply}", flush=True)
+                except OSError as e:
+                    print(f"[ASTROBEE] map not saved: {e}", flush=True)
         r.metrics["max_arm_contact_force_n"] = self._max_contact
         rows = self.rows
         valid = [x for x in rows if not math.isnan(x["position_error_mm"])]

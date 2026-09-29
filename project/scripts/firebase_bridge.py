@@ -41,6 +41,8 @@ TERMINAL_STATES = {
     # moving client (`--moving_dock`)
     "CLIENT_RELEASE_FAILED", "VELOCITY_MATCH_TIMEOUT", "RENDEZVOUS_TIMEOUT", "STOP_FAILED",
     "ROBOT_RELEASE_FAILED", "ARM_RETREAT_FAILED", "SEPARATION_COLLISION", "SEPARATION_FAILED",
+    # obstructed (or unobserved) nozzle corridor in the satellite map: final docking verdict
+    "DOCKING_UNAVAILABLE",
 }
 # Non-terminal states that also complete the session (none: the release / retreat /
 # departure after the docking still belong to the run, which ends at SUCCESS)
@@ -69,6 +71,7 @@ FAILURE_STAGES = {
     "PHYSICS_ERROR": "PHYSICS", "ABORTED": "ABORTED",
     "CLIENT_RELEASE_FAILED": "APPROACH", "VELOCITY_MATCH_TIMEOUT": "APPROACH", "RENDEZVOUS_TIMEOUT": "APPROACH",
     "STOP_FAILED": "DOCKING", "ROBOT_RELEASE_FAILED": "RELEASE", "ARM_RETREAT_FAILED": "RELEASE",
+    "DOCKING_UNAVAILABLE": "DOCKING",
     "SEPARATION_COLLISION": "SEPARATION", "SEPARATION_FAILED": "SEPARATION",
 }
 
@@ -284,6 +287,27 @@ class VideoRecorder:
             print(f"[VIDEO] encoding failed for session {session_id}", flush=True)
 
 
+def write_ply(path: str, points, obstruction) -> str:
+    """Binary PLY of a map snapshot: float32 xyz + uint8 rgb (obstruction voxels red)."""
+    import numpy as np
+
+    p = np.asarray(points, dtype="<f4").reshape(-1, 3)
+    rec = np.zeros(len(p), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
+    rec["x"], rec["y"], rec["z"] = p[:, 0], p[:, 1], p[:, 2]
+    rgb = np.where(np.asarray(obstruction, dtype=bool)[:, None], [255, 40, 40], [200, 200, 210]).astype(np.uint8)
+    rec["r"], rec["g"], rec["b"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(p)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+    part = path + ".part"
+    with open(part, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(rec.tobytes())
+    os.replace(part, path)
+    return path
+
+
 class SessionRecorder:
     """Turns the ROS messages into rows. No ROS / Firebase imports: unit-testable with plain dicts.
 
@@ -293,9 +317,13 @@ class SessionRecorder:
     """
 
     def __init__(self, sink, rate_hz: float = 5.0, session_id: Optional[str] = None, idle_timeout_s: float = 30.0,
-                 video: Optional[VideoRecorder] = None):
+                 video: Optional[VideoRecorder] = None, map_dir: Optional[str] = None):
         self.sink = sink
         self.video = video
+        # Satellite map snapshot (latched PointCloud2 of the observer): the latest one of the
+        # session is written to `<map_dir>/<session_id>.ply` when the session finishes
+        self.map_dir = map_dir
+        self.map_cloud = None
         self.period = 1.0 / max(rate_hz, 1e-6)
         self.fixed_id = session_id
         self.idle_timeout_s = idle_timeout_s
@@ -341,6 +369,9 @@ class SessionRecorder:
     def on_viewport(self, t: float, rgb):
         if self.video is not None and self.session_id is not None:
             self.video.frame(t, rgb)
+
+    def on_map(self, points, obstruction):
+        self.map_cloud = (points, obstruction)
 
     def on_status(self, s: Dict[str, Any]):
         self.last_msg_wall = time.time()
@@ -581,6 +612,14 @@ class SessionRecorder:
         }, merge=True)
         self.sink.flush()
         print(f"[DB] session {self.session_id} finished: capture={capture_success} docking={docking_success} mission={mission_success} failure={failure}", flush=True)
+        if self.map_dir is not None and self.map_cloud is not None:
+            try:
+                os.makedirs(self.map_dir, exist_ok=True)
+                path = write_ply(os.path.join(self.map_dir, f"{self.session_id}.ply"), *self.map_cloud)
+                print(f"[MAP] {path}: {len(self.map_cloud[0])} points", flush=True)
+            except OSError as e:
+                print(f"[MAP] point cloud not saved: {e}", flush=True)
+        self.map_cloud = None
         self.session_id = None
         if self.video is not None:
             self.video.close()
@@ -597,12 +636,26 @@ class SessionRecorder:
 ################
 
 
-def run_ros(rec: SessionRecorder, ns: str):
+def cloud_to_arrays(m):
+    """(N, 3) xyz and (N,) obstruction flags of a PointCloud2 with float32 x, y, z
+    (+ optional `obstruction`) fields."""
+    import numpy as np
+
+    offsets = {f.name: f.offset for f in m.fields}
+    n = int(m.width) * int(m.height)
+    raw = np.frombuffer(bytes(m.data), dtype=np.uint8)[: n * m.point_step].reshape(n, m.point_step)
+    col = lambda name: raw[:, offsets[name]:offsets[name] + 4].copy().view("<f4")[:, 0]  # noqa: E731
+    xyz = np.column_stack([col(k) for k in ("x", "y", "z")])
+    flags = col("obstruction") > 0.5 if "obstruction" in offsets else np.zeros(n, dtype=bool)
+    return xyz, flags
+
+
+def run_ros(rec: SessionRecorder, ns: str, map_topic: Optional[str] = None):
     import rclpy
     from geometry_msgs.msg import PoseStamped
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, PointCloud2
     from std_msgs.msg import Bool, String
 
     import numpy as np
@@ -657,6 +710,18 @@ def run_ros(rec: SessionRecorder, ns: str):
     if rec.video is not None:
         node.create_subscription(Image, f"/{ns}/viewport/image_raw", viewport_cb,
                                  QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT))
+
+    def map_cb(m):
+        try:
+            xyz, flags = cloud_to_arrays(m)
+        except (KeyError, ValueError) as e:
+            print(f"[MAP] invalid point cloud: {e}", flush=True)
+            return
+        with lock:
+            rec.on_map(xyz, flags)
+
+    if rec.map_dir is not None and map_topic:
+        node.create_subscription(PointCloud2, map_topic, map_cb, latched)
     print(f"[DB] listening on /{ns}/ ...", flush=True)
 
     stop = threading.Event()
@@ -689,13 +754,18 @@ def main():
                     help="session videos <session_id>.mp4 (viewport, sim-time aligned) for the web dashboard")
     ap.add_argument("--video_fps", type=float, default=10.0, help="session video frames per second of simulation time")
     ap.add_argument("--no_video", action="store_true", help="do not record the session video")
+    ap.add_argument("--map_topic", default="/astrobee/map/points",
+                    help="satellite map snapshots (sensor_msgs/PointCloud2); the last one of a session is saved as "
+                         "<video_dir>/<session_id>.ply for the web dashboard")
+    ap.add_argument("--no_map", action="store_true", help="do not save the session point cloud")
     args = ap.parse_args()
 
     sink = StdoutSink() if args.dry_run else FirestoreSink(args.credentials, args.project_id)
     video = None if args.no_video else VideoRecorder(os.path.normpath(args.video_dir), args.video_fps)
-    rec = SessionRecorder(sink, args.rate_hz, args.session_id, args.idle_timeout, video)
+    map_dir = None if args.no_map else os.path.normpath(args.video_dir)
+    rec = SessionRecorder(sink, args.rate_hz, args.session_id, args.idle_timeout, video, map_dir)
     try:
-        run_ros(rec, args.namespace.strip("/"))
+        run_ros(rec, args.namespace.strip("/"), None if args.no_map else args.map_topic)
     finally:
         sink.close()
 
