@@ -22,7 +22,7 @@
 
 <p align="center">
   <img src ="./docs/image/image.png" width="300"> <img src ="./docs/image/image (1).png" width="300">    
-  <img src ="./docs/image/image (2).png" width="300"> <img src ="./docs/image/UI_페이지1.png" width="300">
+  <img src ="./docs/image/web_ui.png" width="300"> <img src ="./docs/image/point_cloud.png" width="300"> 
 </p>
 
 ## 0. 시스템 개요
