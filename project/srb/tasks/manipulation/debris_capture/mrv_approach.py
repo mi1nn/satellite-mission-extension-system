@@ -750,18 +750,28 @@ class ThrusterVfx:
         moves to the nearest grid point on that wall, so it sits on the flat bus face and
         not inside an appendage in front of it (on this hull the -X face carries a 5 m
         high-gain dish). A nozzle with no wall point nearby keeps its own first hit, or
-        the cone anchor if its line misses the hull. Cached per exhaust direction (body
-        frame), so this runs once per leg.
+        the cone anchor if its line misses the hull. Cached per exhaust FACE (dominant
+        body axis + sign), so this runs once per face.
+
+        The nozzle points (`anchors`) depend only on that face, so the scan is done along
+        the face's axis. Keying on the exact direction instead re-scanned on every step
+        while the MRV's station keeping turned the thrust by a fraction of a degree (after
+        the docking, measured: a 0.028 off-axis component), and an off-axis direction
+        also takes the slow n x n ray-cast path of `_wall_anchors`: the simulation
+        practically stopped at ROBOT_RELEASE.
         """
         pairs = self.anchors(plume_dir_w, hull)
         if not pairs:
             return pairs
         d_body = hull.rot.T @ pairs[0][1]
-        key = tuple(np.round(d_body, 3))
+        axis = int(np.argmax(np.abs(d_body)))
+        key = (axis, math.copysign(1.0, d_body[axis]))
         if key not in self._fire_anchor_cache:
             noz = [hull.rot.T @ (pos - hull.pos) for pos, _ in pairs]
             tris = self.hull_triangles(hull)
-            self._fire_anchor_cache[key] = noz if tris is None else _wall_anchors(noz, d_body, tris)
+            d_face = np.zeros(3)
+            d_face[axis] = key[1]
+            self._fire_anchor_cache[key] = noz if tris is None else _wall_anchors(noz, d_face, tris)
         return [(hull.point(p), d) for p, (_, d) in zip(self._fire_anchor_cache[key], pairs)]
 
     def update(self, plume_dir_w: Optional[np.ndarray], mrv_offset: np.ndarray):

@@ -51,7 +51,7 @@ import numpy as np
 import torch
 
 from .docking_demo import ArmKinematics, interp_frame
-from . import moving_dock, probe_dock
+from . import coupled_dock, moving_dock, probe_dock
 from .frames import Frame, axis_angle, rotation_angle
 from .moving_dock import (
     MrvVelocityController,
@@ -143,6 +143,9 @@ class State(Enum):
     DOCK_TARGET_ACQUIRE = "DOCK_TARGET_ACQUIRE"
     PRE_DOCK_APPROACH = "PRE_DOCK_APPROACH"
     XY_ALIGN = "XY_ALIGN"
+    # `docking_control.mode: coupled_predictive` only: lateral + attitude together
+    # (replaces XY_ALIGN -> ORIENTATION_ALIGN; ALIGNMENT_CHECK follows as before)
+    POSITION_ATTITUDE_ALIGN = "POSITION_ATTITUDE_ALIGN"
     ORIENTATION_ALIGN = "ORIENTATION_ALIGN"
     ALIGNMENT_CHECK = "ALIGNMENT_CHECK"
     Z_APPROACH = "Z_APPROACH"
@@ -192,10 +195,11 @@ MRV_STATES = {State.MRV_MOVE_STEP_1, State.MRV_STEP_1_REACHED, State.MRV_MOVE_ST
 MRV_MOTION = {State.MRV_MOVE_STEP_1, State.MRV_MOVE_STEP_2}
 # States of the docking phase (the probe tip is the controlled frame in all of them)
 DOCKING_STATES = {State.DOCK_TARGET_ACQUIRE, State.PRE_DOCK_APPROACH, State.XY_ALIGN, State.ORIENTATION_ALIGN,
-                  State.ALIGNMENT_CHECK, State.Z_APPROACH, State.FINAL_INSERTION, State.DOCK_READY,
+                  State.POSITION_ATTITUDE_ALIGN, State.ALIGNMENT_CHECK, State.Z_APPROACH, State.FINAL_INSERTION, State.DOCK_READY,
                   State.DOCKED, State.DOCK_HOLDING}
 # ... of which these actively command a motion towards the docking axis
-DOCKING_MOTION = {State.PRE_DOCK_APPROACH, State.XY_ALIGN, State.ORIENTATION_ALIGN, State.Z_APPROACH, State.FINAL_INSERTION}
+DOCKING_MOTION = {State.PRE_DOCK_APPROACH, State.XY_ALIGN, State.ORIENTATION_ALIGN, State.POSITION_ATTITUDE_ALIGN,
+                  State.Z_APPROACH, State.FINAL_INSERTION}
 TERMINAL = FAILURES | {State.SUCCESS}
 TRACKING = {State.APPROACHING, State.SLOW_APPROACH, State.CAPTURE_ATTEMPT, State.STATIC_MEASURE}
 # Moving-client states before / after the (unchanged) docking states
@@ -533,6 +537,19 @@ class VisionCaptureDemo:
         self._depth_reason: str = "not read yet"
         self._dock_rows: List[dict] = []
         self._dock_csv = self._dock_csv_file = None
+        ## Docking controller (`docking_control.mode`); the metrics / CSV run in both modes
+        self.coupled = self.cfg.docking_control.mode == "coupled_predictive"
+        self._cd_tracker = coupled_dock.TRACKERS.get(self.cfg.docking_control.mode, coupled_dock.CoupledPoseTracker)(self.cfg.docking_control)
+        self._cd_gate = coupled_dock.AlignmentGate(self.cfg.docking_alignment)
+        self._cd_metrics = coupled_dock.DockingControlMetrics()
+        self._cd_tip_twist = coupled_dock.TwistEstimator()
+        self._cd_active = False  # the coupled tracker has taken over the reference
+        self._cd_axial: Optional[float] = None  # axial set point of the desired tip [m]
+        self._cd_axial_rate = 0.0  # its rate [m/s] (fed forward along the docking axis)
+        self._cd_last: Optional[Dict[str, object]] = None
+        self._cd_scale = 1.0
+        self._cd_out: Optional[coupled_dock.TrackerOutput] = None
+        self._cd_csv = self._cd_csv_file = None
         self._probe_frames: List[Path] = []
         self._next_dock_log_t = 0.0
         self._next_probe_rgb_t = 0.0
@@ -603,6 +620,11 @@ class VisionCaptureDemo:
                 self._dock_csv_file = open(self.dock_csv_path, "w", newline="")
                 self._dock_csv = csv.DictWriter(self._dock_csv_file, fieldnames=list(probe_dock.CSV_COLUMNS))
                 self._dock_csv.writeheader()
+            self.dock_control_csv_path = out_dir / f"{self.label}_docking_control.csv"
+            if self.cfg.logging.csv_enabled:
+                self._cd_csv_file = open(self.dock_control_csv_path, "w", newline="")
+                self._cd_csv = csv.DictWriter(self._cd_csv_file, fieldnames=list(coupled_dock.CSV_COLUMNS))
+                self._cd_csv.writeheader()
         self._mv_csv = self._mv_csv_file = None
         if self.moving:
             self.moving_csv_path = out_dir / f"{self.label}_moving.csv"
@@ -806,6 +828,8 @@ class VisionCaptureDemo:
             # being applied); the MRV keeps its station on the client while the MEP is held,
             # and stops otherwise (`moving_after_step`)
             self.clear_wrenches()
+        if getattr(self, "_cd_metrics", None) is not None:
+            self._cd_metrics.transition(self.state.value, state.value)
         self.state = state
         self.state_time = 0.0
         self._settled_since = None
@@ -1493,10 +1517,17 @@ class VisionCaptureDemo:
             tip = self.probe_world().pos.copy()
             self._tip_history.append((self.sim_time, self.sat_frame().inv().point(tip) if self._mv_active else tip))
             self._tip_history = [x for x in self._tip_history if x[0] >= self.sim_time - 3.0 * self.cfg.docking.settle_window_s]
+            cm = self.control_measure(m)  # both modes: metrics + control log
             if s == State.DOCK_TARGET_ACQUIRE:
                 self.step_dock_target_acquire(m)
             elif s == State.PRE_DOCK_APPROACH:
                 self.step_pre_dock(m)
+            elif s == State.POSITION_ATTITUDE_ALIGN:
+                self.step_position_attitude_align(m, cm)
+            elif self.coupled and s == State.ALIGNMENT_CHECK:
+                self.step_coupled_alignment_check(m, cm)
+            elif self.coupled and s in (State.Z_APPROACH, State.FINAL_INSERTION):
+                self.step_coupled_approach(m, cm, final=s == State.FINAL_INSERTION)
             elif s == State.XY_ALIGN:
                 self.step_xy_align(m)
             elif s == State.ORIENTATION_ALIGN:
@@ -1516,6 +1547,7 @@ class VisionCaptureDemo:
             if self.sim_time >= self._next_dock_log_t:
                 self._next_dock_log_t = self.sim_time + 1.0 / self.cfg.logging.rate_hz - 1e-9
                 self.log_dock_row(m)
+                self.log_control_row(m, cm)
                 if not self._mv_active:
                     self.update_motion_hud(m)  # the moving client refreshes it in `moving_after_step`
                 if self.cfg.logging.debug_draw:
@@ -2054,12 +2086,16 @@ class VisionCaptureDemo:
         # Hand over only once the swing left by the transport has died out, otherwise the
         # alignment chases a tip that is still moving 100+ mm per half period
         forced = self.forced_insertion()
-        if pe < 0.05 and (forced or self.tip_settled()):
+        # coupled_predictive: no settle window, ALIGNMENT_CHECK gates the relative velocity
+        if pe < 0.05 and (forced or self.coupled or self.tip_settled()):
             self._dock_axial_hold = m["axial"]
             self.frame_docking_view(close=True)
             print(f"[DOCK] pre-dock reached{' (forced insertion: no settle wait)' if forced else ' and settled'}: tip {-m['insertion_depth']:.3f} m in front of the nozzle exit, "
                   f"lateral {m['lateral']*1000:.1f} mm, axis {m['axis_deg']:.2f} deg, goal error {pe*1000:.0f} mm", flush=True)
-            self.goto(State.ALIGNMENT_CHECK if forced else State.XY_ALIGN)
+            if self.coupled:
+                self.goto(State.POSITION_ATTITUDE_ALIGN)
+            else:
+                self.goto(State.ALIGNMENT_CHECK if forced else State.XY_ALIGN)
         else:
             self._dock_stage_timeout(m)
 
@@ -2251,8 +2287,18 @@ class VisionCaptureDemo:
     def step_dock_ready(self, m):
         """Every docking condition is re-checked here; only then is the joint created."""
         d = self.cfg.docking
-        self.track_probe(probe_dock.tip_goal(self.dock_world(), 0.0), d.insertion_speed_mps,
-                         max_step=0.5 * self.cfg.approach.max_joint_step_rad)
+        if self.coupled:
+            # The docking conditions already hold the tip at the dock point: keep it there
+            # relative to the client (axial set point frozen at the tip on entry) instead
+            # of pressing on towards 0 -- pressing pushed the client and the MRV followed
+            cm = self._cd_last
+            if not self._dock.get("cd_ready_axial_frozen"):
+                self._dock["cd_ready_axial_frozen"] = True
+                self._cd_axial = cm["axial"]
+            self.coupled_track(cm, self._hold_axial(cm), max_step=0.5 * self.cfg.approach.max_joint_step_rad)
+        else:
+            self.track_probe(probe_dock.tip_goal(self.dock_world(), 0.0), d.insertion_speed_mps,
+                             max_step=0.5 * self.cfg.approach.max_joint_step_rad)
         if self.corridor_blocked("at DOCK_READY", record_pass=False):  # every step: log only a change
             return
         valid, why = self.docking_tracking_valid()
@@ -2267,6 +2313,10 @@ class VisionCaptureDemo:
                       f"depth {m['insertion_depth']:.3f} m inside the nozzle, relative velocity {m['rel_speed']*1000:.1f} mm/s, "
                       f"wall clearance {m['clearance']*1000:.0f} mm, depth reading {m['depth_distance']:.3f} m")
             print(f"[DOCK] DOCK_READY  t={self.sim_time:.2f} s | {detail}", flush=True)
+            cm = self._cd_last
+            self._cd_metrics.docked(self.sim_time, {
+                "position_error_m": math.hypot(cm["lateral"], cm["axial"]),
+                "orientation_error_deg": cm["orientation_deg"], "relative_speed_mps": cm["rel_speed"]})
             self.results.check("[DOCK4] Docking conditions", True, detail)
             sat_before = self.sat_frame()
             self.task.docking.dock()
@@ -2314,6 +2364,226 @@ class VisionCaptureDemo:
             self.results.check("[DOCK7] No penetration while docked", h["hold_min_clearance_mm"] > 0.0,
                                f"min probe-to-wall clearance {h['hold_min_clearance_mm']:.0f} mm")
             self.goto(State.SUCCESS)
+
+    #####################################################################
+    ### Coupled predictive docking control (`docking_control.mode`) ###
+    #####################################################################
+    ## `coupled_dock.py` has the math. Only POSITION_ATTITUDE_ALIGN and, with
+    ## `mode: coupled_predictive`, ALIGNMENT_CHECK / Z_APPROACH / FINAL_INSERTION /
+    ## DOCK_READY's tracking run here; `control_measure` and `log_control_row` run in
+    ## both modes (read-only) so the two controllers are logged the same way.
+
+    def client_twist(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(CoM [m], CoM velocity [m/s], angular velocity [rad/s]) of the client, world."""
+        d = self.task._satellite.data
+        return (d.root_com_pos_w[0].cpu().numpy().astype(float), d.root_com_lin_vel_w[0].cpu().numpy().astype(float),
+                d.root_com_ang_vel_w[0].cpu().numpy().astype(float))
+
+    def control_measure(self, m) -> Dict[str, object]:
+        """Client motion, predicted dock frame and measured-tip gate errors (both modes)."""
+        c = self.cfg.docking_control
+        tip, dock = self.probe_world(), self.dock_world()
+        com, v_com, w_c = self.client_twist()
+        T = float(c.prediction_horizon_sec)
+        v_tip, w_tip = self._cd_tip_twist.update(self.sim_time, tip)
+        v_port = coupled_dock.point_velocity(dock.pos, com, v_com, w_c)
+        ge = coupled_dock.dock_frame_errors(tip, dock)
+        rel_v = v_tip - v_port if v_tip is not None else np.full(3, math.nan)
+        rel_w = w_tip - w_c if w_tip is not None else np.full(3, math.nan)
+        cm = {
+            "tip": tip, "dock": dock, "com": com, "v_com": v_com, "w_c": w_c, "T": T,
+            "dock_pred": coupled_dock.predict_body_frame(dock, com, v_com, w_c, T),
+            "v_port": v_port, "v_tip": v_tip, "w_tip": w_tip, "rel_v": rel_v, "rel_w": rel_w,
+            "rel_speed": float(np.linalg.norm(rel_v)), "rel_rate_deg_s": math.degrees(float(np.linalg.norm(rel_w))),
+            "insertion_depth": m["insertion_depth"], **ge,
+        }
+        cm["scale"] = coupled_dock.alignment_scale(c, cm["lateral"], cm["orientation_deg"])
+        self._cd_metrics.update(self.sim_time, self.state.value, cm["lateral"], cm["orientation_deg"], cm["rel_speed"],
+                                m["insertion_depth"])
+        self._cd_last = cm
+        return cm
+
+    def _hold_axial(self, cm) -> float:
+        """Alignment states: the desired tip stays at a frozen axial distance (as the
+        legacy `align_goal`: a live axial goal would follow the arm's own swing)."""
+        if self._cd_axial is None:
+            self._cd_axial = cm["axial"]
+        self._cd_axial_rate = 0.0
+        return self._cd_axial
+
+    def _advance_axial(self, cm, speed: float) -> float:
+        """Axial set point moved towards the dock point at `speed` [m/s] RELATIVE to the
+        client, never more than `max_axial_lead_m` (inside the nozzle
+        `max_axial_lead_inside_m`) ahead of the measured tip."""
+        c = self.cfg.docking_control
+        old = self._hold_axial(cm)
+        lead = c.max_axial_lead_inside_m if cm["insertion_depth"] > 0.0 else c.max_axial_lead_m
+        new = min(0.0, old + max(0.0, speed) * self.dt, cm["axial"] + lead)
+        self._cd_axial, self._cd_axial_rate = new, (new - old) / self.dt
+        return new
+
+    def coupled_track(self, cm, axial_cmd: float, max_step: Optional[float] = None):
+        """One coupled position + attitude tracking step of the probe-tip reference
+        towards the desired tip pose on the PREDICTED docking axis (`coupled_dock`)."""
+        if self._dock_ref is None:
+            self._dock_ref = self.arm.tool_pose()
+        if not self._cd_active:  # take over from the transport without a velocity step
+            self._cd_active = True
+            self._cd_tracker.reset(cm["v_tip"] if cm["v_tip"] is not None else cm["v_port"],
+                                   cm["w_tip"] if cm["w_tip"] is not None else np.zeros(3))
+        prev = self._dock_ref
+        desired = coupled_dock.desired_tip(cm["dock_pred"], axial_cmd)
+        com_pred = cm["com"] + cm["v_com"] * cm["T"]
+        v_des = (coupled_dock.point_velocity(desired.pos, com_pred, cm["v_com"], cm["w_c"])
+                 + self._cd_axial_rate * desired.rot[:, 2])
+        v_tip = cm["v_tip"] if cm["v_tip"] is not None else v_des
+        w_tip = cm["w_tip"] if cm["w_tip"] is not None else cm["w_c"]
+        out = self._cd_tracker.step(prev, cm["tip"], v_tip, w_tip, desired, v_des, cm["w_c"], self.dt)
+        self._cd_out = out
+        ref = out.ref
+        if float(np.linalg.norm(ref.pos - prev.pos)) < 1e-7 and rotation_angle(prev.rot, ref.rot) < 1e-7:
+            return self.hold()  # at rest on a static goal: latch the joints (see `track_probe`)
+        self._dock_ref = ref
+        self.q_hold = None
+        q = self.arm.ik_joint_target(ref, self.cfg.approach.max_joint_step_rad if max_step is None else max_step)
+        self.task._robot.set_joint_position_target(q, joint_ids=self.arm.joint_ids)
+        # The reference's own twist as joint velocity target (drives are PD on q and q_dot)
+        self.set_velocity_feedforward((ref.pos - prev.pos) / self.dt, so3_log(ref.rot @ prev.rot.T) / self.dt)
+
+    def step_position_attitude_align(self, m, cm):
+        """Lateral and attitude errors reduced together at a frozen axial distance."""
+        self.coupled_track(cm, self._hold_axial(cm), max_step=0.5 * self.cfg.approach.max_joint_step_rad)
+        ok, bad = self._cd_gate.entry_conditions(cm["lateral"], cm["orientation_deg"], cm["rel_speed"], cm["rel_rate_deg_s"])
+        if ok:
+            print(f"[DOCK] position + attitude aligned: lateral {cm['lateral']*1000:.1f} mm, orientation "
+                  f"{cm['orientation_deg']:.2f} deg, relative {cm['rel_speed']*1000:.1f} mm/s / {cm['rel_rate_deg_s']:.2f} deg/s", flush=True)
+            self._cd_gate.reset()
+            self.goto(State.ALIGNMENT_CHECK)
+        else:
+            self._dock_stage_timeout(m)
+
+    def step_coupled_alignment_check(self, m, cm):
+        """Every condition held for `docking_alignment.stable_duration_sec` (no timer-only
+        wait); back to POSITION_ATTITUDE_ALIGN only past the wider rollback thresholds."""
+        d, a = self.cfg.docking, self.cfg.docking_alignment
+        self.coupled_track(cm, self._hold_axial(cm), max_step=0.5 * self.cfg.approach.max_joint_step_rad)
+        back, bad_rb = self._cd_gate.rollback(self.sim_time, cm["lateral"], cm["orientation_deg"])
+        if back:
+            return self.goto(State.POSITION_ATTITUDE_ALIGN, "; ".join(bad_rb))
+        forced = self.forced_insertion()
+        blocked = []
+        if d.auto_calibrate and d.depth_enabled and self._depth_offset is None:
+            self._calibrate_depth(m)  # on-axis samples only (same rule as legacy)
+            if self._depth_offset is None and d.require_depth and not forced:
+                blocked.append("depth not calibrated on the docking axis yet")
+        if self._mv_active and self.cfg.rendezvous.concurrent_docking:
+            ok_mv, bad_mv = self.insertion_gates(mep_speed=not forced)
+            blocked += [] if ok_mv else bad_mv
+        passed, held, bad = self._cd_gate.entry(self.sim_time, cm["lateral"], cm["orientation_deg"], cm["rel_speed"],
+                                                cm["rel_rate_deg_s"], blocked)
+        if passed:
+            self.results.check("[DOCK2] Alignment before the docking-axis approach", True,
+                               f"coupled: lateral {cm['lateral']*1000:.2f} mm (< {a.position_threshold_m*1000:.0f}), orientation "
+                               f"{cm['orientation_deg']:.3f} deg (< {a.orientation_threshold_deg:g}), relative {cm['rel_speed']*1000:.1f} mm/s, "
+                               f"{cm['rel_rate_deg_s']:.2f} deg/s, held {held:.2f} s")
+            print(f"[DOCK] coupled alignment held {held:.2f} s; starting the docking-axis approach "
+                  f"(remaining {m['geometry_distance']:.3f} m)", flush=True)
+            self._cd_gate.reset()
+            self.goto(State.Z_APPROACH)
+        else:
+            self._dock_stage_timeout(m)
+
+    def step_coupled_approach(self, m, cm, final: bool):
+        """Docking-axis approach at a soft-gated speed while position and attitude keep
+        being tracked; emergency hard stop / hysteresis rollback back to aligning."""
+        d, c = self.cfg.docking, self.cfg.docking_control
+        forced = self.forced_insertion()
+        # Relative speed is a contact hazard only inside the nozzle (the far approach
+        # itself closes at up to `approach_speed_mps`)
+        inside = m["insertion_depth"] > 0.0
+        rel = cm["rel_speed"] if inside and math.isfinite(cm["rel_speed"]) else 0.0
+        stop, bad = coupled_dock.emergency_stop(c, cm["lateral"], cm["orientation_deg"], rel, m["clearance"], d.min_wall_clearance_m)
+        back = stop
+        if not stop:
+            back, bad = self._cd_gate.rollback(self.sim_time, cm["lateral"], cm["orientation_deg"])
+        if back:
+            self._dock["realigns"] = int(self._dock.get("realigns", 0)) + 1
+            self._cd_axial, self._cd_axial_rate, self._dock_speed = cm["axial"], 0.0, 0.0
+            if stop:  # hard stop: no relative motion from here, the reference is the tip
+                self._cd_metrics.emergency_stops += 1
+                self._cd_tracker.reset(cm["v_port"], cm["w_c"])
+                self.dock_hold()
+            print(f"[DOCK] {'EMERGENCY STOP' if stop else 'approach rolled back'}, re-aligning: {'; '.join(bad)}", flush=True)
+            return self.goto(State.POSITION_ATTITUDE_ALIGN, "; ".join(bad))
+        if forced and self._depth_offset is None and d.auto_calibrate and d.depth_enabled:
+            self._calibrate_depth(m)  # on-axis samples only; the reading is advisory here
+        valid, why = self.docking_tracking_valid()
+        if not valid:
+            return self.goto(State.DOCK_FAILED, f"docking target invalid: {why}")
+        remaining = m["geometry_distance"]
+        if d.require_depth and not m["depth_ok"] and not forced:  # same fail-safe as legacy
+            self._dock["depth_blocked_s"] = float(self._dock.get("depth_blocked_s", 0.0)) + self.dt
+            if not self._dock.get("depth_warned"):
+                self._dock["depth_warned"] = True
+                print(f"[DOCK] holding: {self._depth_reason}", flush=True)
+            speed = 0.0
+        else:
+            self._dock["depth_warned"] = False
+            # Soft gate: the approach profile scaled by the alignment (never a 0/1 switch)
+            speed = probe_dock.decelerated(d, probe_dock.approach_speed(d, remaining), remaining, d.z_decel_gain_hz) * cm["scale"]
+        self._cd_scale = cm["scale"]
+        self._dock_speed = probe_dock.ramped(d, self._dock_speed, speed, self.dt)
+        self._dock["commanded_speed"] = self._dock_speed
+        step = self.cfg.approach.max_joint_step_rad if not final else 0.5 * self.cfg.approach.max_joint_step_rad
+        self.coupled_track(cm, self._advance_axial(cm, self._dock_speed), max_step=step)
+        if m["insertion_depth"] > 0.0:
+            self._dock["min_clearance"] = min(float(self._dock.get("min_clearance", math.inf)), m["clearance"])
+            self._dock["max_lateral_inserting"] = max(float(self._dock.get("max_lateral_inserting", 0.0)), m["lateral"])
+        if not final and remaining <= d.insertion_zone_m:
+            print(f"[DOCK] final insertion zone ({remaining*1000:.0f} mm remaining, alignment scale {cm['scale']:.2f}, "
+                  f"wall clearance {m['clearance']*1000:.0f} mm)", flush=True)
+            return self.goto(State.FINAL_INSERTION)
+        if final and abs(m["axial"]) <= d.dock_axial_m:
+            return self.goto(State.DOCK_READY)
+        self._dock_stage_timeout(m)
+
+    def log_control_row(self, m, cm):
+        """`<run>_docking_control.csv` row (both modes; see `coupled_dock.CSV_COLUMNS`)."""
+        if self._cd_csv is None:
+            return
+        axial = self._cd_axial if (self.coupled and self._cd_axial is not None) else cm["axial"]
+        desired = coupled_dock.desired_tip(cm["dock_pred"], axial)
+        e_p, e_r = coupled_dock.pose_error(desired, cm["tip"])
+        out = self._cd_out if self.coupled else None
+        row = {"run_id": self.label, "timestamp": round(self.sim_time, 4), "mode": self.cfg.docking_control.mode,
+               "fsm_state": self.state.value}
+
+        def put(prefix, v, keys="xyz", q=""):
+            row.update({f"{prefix}_{q}{k}": ("" if v is None else float(x)) for k, x in zip(keys, v if v is not None else [None] * len(keys))})
+
+        put("client_dock_position", cm["dock"].pos)
+        put("client_dock_orientation", cm["dock"].quat, "wxyz", "q")
+        put("client_linear_velocity", cm["v_com"])
+        put("client_angular_velocity", cm["w_c"])
+        put("desired_dock_position", cm["dock_pred"].pos)
+        put("desired_dock_orientation", cm["dock_pred"].quat, "wxyz", "q")
+        put("probe_tip_position", cm["tip"].pos)
+        put("probe_tip_orientation", cm["tip"].quat, "wxyz", "q")
+        put("position_error", e_p)
+        put("orientation_error_rotvec", e_r)
+        put("relative_linear_velocity", cm["rel_v"])
+        put("relative_angular_velocity", cm["rel_w"])
+        put("command_linear_velocity", None if out is None else out.v_cmd)
+        put("command_angular_velocity", None if out is None else out.w_cmd)
+        row.update({
+            "position_error_m": float(np.linalg.norm(e_p)), "lateral_error_m": cm["lateral"], "axial_error_m": cm["axial"],
+            "orientation_error_deg": cm["orientation_deg"], "relative_speed_mps": cm["rel_speed"],
+            "relative_angular_rate_deg_s": cm["rel_rate_deg_s"], "prediction_horizon": cm["T"], "axial_command_m": axial,
+            "approach_speed": float(self._dock_speed), "alignment_scale": cm["scale"],
+            "rollback_count": self._cd_metrics.rollbacks, "emergency_stop_count": self._cd_metrics.emergency_stops,
+            "docking_success": int(self.task.docking.is_docked),
+        })
+        self._cd_csv.writerow({k: row.get(k, "") for k in coupled_dock.CSV_COLUMNS})
 
     ###############################################################
     ### Moving client: rendezvous -> dock -> stop -> release -> depart ###
@@ -4005,6 +4275,8 @@ class VisionCaptureDemo:
             self._csv_file.close()
         if self._dock_csv_file is not None:
             self._dock_csv_file.close()
+        if self._cd_csv_file is not None:
+            self._cd_csv_file.close()
         if self._mv_csv_file is not None:
             self._mv_csv_file.close()
         if self.ros is not None:
@@ -4256,6 +4528,12 @@ class VisionCaptureDemo:
             "max_lateral_while_inserting_m": float(dk.get("max_lateral_inserting", 0.0)),
             "at_dock": dk.get("at_dock"),
         })
+        # Controller comparison metrics (same keys for both `docking_control.mode`s)
+        cmp_ = self._cd_metrics.summary(self.cfg.docking_control.mode, docked)
+        cmp_["csv"] = str(getattr(self, "dock_control_csv_path", "")) if self.cfg.logging.csv_enabled else "disabled"
+        r.metrics["docking_control"] = cmp_
+        print("[DOCK] controller metrics: " + ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                                                        for k, v in cmp_.items() if k != "csv"), flush=True)
         if self._dock_csv is not None:
             r.check("[DOCK] CSV generated", len(self._dock_rows) > 0,
                     f"{len(self._dock_rows)} rows -> {getattr(self, 'dock_csv_path', '')}")

@@ -60,7 +60,7 @@ window.initValidation = async function () {
       index: 4,
       key: 'DOCK_PREP',
       label: '도킹 준비',
-      states: ['DOCK_TARGET_ACQUIRE', 'PRE_DOCK_APPROACH', 'XY_ALIGN', 'ORIENTATION_ALIGN', 'ALIGNMENT_CHECK', 'CLIENT_RELEASE', 'CLIENT_CRUISE', 'CHASE', 'VELOCITY_MATCHING', 'RENDEZVOUS', 'CLIENT_RELEASE_FAILED', 'VELOCITY_MATCH_TIMEOUT', 'RENDEZVOUS_TIMEOUT'],
+      states: ['DOCK_TARGET_ACQUIRE', 'PRE_DOCK_APPROACH', 'XY_ALIGN', 'ORIENTATION_ALIGN', 'POSITION_ATTITUDE_ALIGN', 'ALIGNMENT_CHECK', 'CLIENT_RELEASE', 'CLIENT_CRUISE', 'CHASE', 'VELOCITY_MATCHING', 'RENDEZVOUS', 'CLIENT_RELEASE_FAILED', 'VELOCITY_MATCH_TIMEOUT', 'RENDEZVOUS_TIMEOUT'],
       metrics: [
         ['dock_geometry_distance_m', 'Docking Distance', ' m'],
         ['dock_lateral_error_m', 'Lateral Error', ' m'],
