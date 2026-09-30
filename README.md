@@ -80,6 +80,24 @@ GPU 4코어·RAM 32 GB·SSD 여유 50 GB·RTX 4080/16 GB급은 [NVIDIA 사양표
 
 임무 설정은 [`project/config/vision_capture.yaml`](project/config/vision_capture.yaml), 장면·제어는 [`project/srb/tasks/manipulation/debris_capture/`](project/srb/tasks/manipulation/debris_capture/)에 있습니다. 시뮬레이션 자산의 USD 참조 경로는 환경에 따라 점검해야 합니다(아래 설치 4단계).
 
+## 사용한 장비
+
+| 항목 | 사양 |
+|---|---|
+| 노트북 | MSI GPU 노브북 |
+| OS | Ubuntu 24.04 |
+| GPU | RTX 5080 |
+| VRAM | 16GB (16303MiB) |
+| NVIDIA Driver | 580.142 |
+| CUDA Version | 13.0 |
+| RAM | 62GB |
+| Swap | 8GB |
+| Storage | 938GB NVMe |
+| ROS 2 | Jazzy |
+| OS Python | 3.12 |
+| Isaac Sim 내장 Python | 3.11 |
+
+
 ## 저장소 구성
 
 | 경로 | 역할 |
