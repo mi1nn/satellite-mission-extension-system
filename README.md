@@ -97,6 +97,7 @@ GPU 4코어·RAM 32 GB·SSD 여유 50 GB·RTX 4080/16 GB급은 [NVIDIA 사양표
 | OS Python | 3.12 |
 | Isaac Sim 내장 Python | 3.11 |
 
+아래는 실제 시뮬레이션 실행에 사용한 PC 환경입니다.
 
 ## 저장소 구성
 
